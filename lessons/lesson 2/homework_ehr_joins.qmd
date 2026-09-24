@@ -1,0 +1,239 @@
+---
+title: "Homework: Joining Real EHR Data (OMOP CDM)"
+subtitle: "Healthcare Big Data Analytics"
+author: "이름"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: false
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Overview
+
+In this assignment, you will apply joins to **de-identified, synthetic EHR data**.
+
+You will use the **Eunomia** dataset (`GiBleed`), a small OMOP Common Data Model (CDM) database generated from [Synthea](https://synthetichealth.github.io/synthea/) synthetic patients, accessed through the `CDMConnector` and `omock` R packages. No real patient data. No data-use agreement or credentialing is needed.
+
+You can read about OMOP CDM from OHDSI [here](https://www.ohdsi.org/data-standardization/). 
+
+---
+
+# Part 0: Setup
+
+Run this setup chunk once. It installs (if needed) and loads the required packages, then creates a local copy of the `GiBleed` dataset using DuckDB (no server, no Java required).
+
+```{r}
+#| label: setup
+
+# Install these packages if not installed already - dplyr part of tidyverse
+# install.packages(c("CDMConnector", "omock", "dplyr", "DBI", "duckdb"))
+
+library(CDMConnector)
+library(omock)
+library(dplyr)
+
+cdm <- mockCdmFromDataset(datasetName = "GiBleed", source = "duckdb")
+```
+
+Once loaded, take a look at what tables are available:
+
+```{r}
+#| label: list-tables
+
+cdm
+```
+
+You should see tables including `person`, `visit_occurrence`, `condition_occurrence`, `drug_exposure`, `measurement`, `observation_period`, and `concept`, among others. These are OMOP CDM tables. 
+
+No worries about cohort and achilles tables - we'll come back to that later. Cohort tables stores results of a cohort definition, and achilles has a description and quality of data.
+
+---
+
+# Part 1: Explore the Tables
+
+**1.1** Extract the `person` and `visit_occurrence` tables into local R data.frames using `collect()`, and inspect their structure with `glimpse()`.
+
+```{r}
+#| label: explore-person-visits
+
+person <- cdm$person |>
+  collect()
+
+visit_occurrence <- cdm$visit_occurrence |>
+  collect()
+
+glimpse(person)
+glimpse(visit_occurrence)
+```
+
+**Questions:**
+
+a. How many rows are in `person`? What does one row represent?
+
+b. How many rows are in `visit_occurrence`? What does one row represent?
+
+c. Which column is the **primary key** in `person`? Which column in `visit_occurrence` acts as a **foreign key** back to `person`?
+
+d. Is the relationship between `person` and `visit_occurrence` 1:1, 1:many, or many:many? How do you know?
+
+e. Look at the column names in both tables using `names(person)` and `names(visit_occurrence)`. List any names that appear in **both** tables besides the join key. Why might that matter when you join them?
+
+---
+
+# Part 2: Join Person + Visits
+
+**2.1** Join `person` to `visit_occurrence` so that each visit record includes the patient's `gender_concept_id` and `year_of_birth`.
+
+Since `person` and `visit_occurrence` both contain common columns, select only what you need from `person` before joining, to avoid duplicate `.x`/`.y` columns. (In case you want to see what can happen, try the same code but do *not* do the `select()` first.)
+
+```{r}
+#| label: join-person-visits
+
+person_slim <- person |>
+  select(person_id, gender_concept_id, year_of_birth)
+
+person_visits <- left_join(visit_occurrence, person_slim, by = "person_id")
+
+nrow(visit_occurrence)  
+nrow(person_visits)     
+
+names(person_visits)    # any .x / .y duplicate columns?
+```
+
+**2.2** Explain in 1-2 sentences why the counts should (or shouldn't) match, referencing the relationship from Part 1.
+
+**2.3** Using `person_visits`, calculate the number of visits **per patient**, sorted from most to fewest.
+
+```{r}
+#| label: visits-per-patient
+
+visits_per_patient <- person_visits |>
+  group_by(person_id) |>
+  summarize(n_visits = n()) |>
+  arrange(desc(n_visits))
+
+visits_per_patient
+```
+
+**Question:** Which `person_id` has the most visits, and how many?
+
+---
+
+# Part 3: Bring in Diagnoses — A Second Join
+
+Diagnoses are in the `condition_occurrence` table, linked to `visit_occurrence` by `visit_occurrence_id`.
+
+**3.1** Extract `condition_occurrence`, then join it to `visit_occurrence`.
+
+```{r}
+#| label: extract-conditions
+
+condition_occurrence <- cdm$condition_occurrence |>
+  collect()
+
+names(condition_occurrence)
+```
+
+`condition_occurrence` also contains its own `person_id` **and** `provider_id` columns — both of which already exist in `visit_occurrence`. Select only the columns you need before joining.
+
+```{r}
+#| label: join-conditions
+
+condition_slim <- condition_occurrence |>
+  select(condition_occurrence_id, condition_concept_id, condition_start_date, visit_occurrence_id)
+
+visits_with_conditions <- inner_join(visit_occurrence, condition_slim, by = "visit_occurrence_id")
+
+names(visits_with_conditions)      # any .x / .y duplicate columns?
+dim(visits_with_conditions)
+```
+
+**Questions to answer in your write-up:**
+
+a. Why did we use `inner_join()` here instead of `left_join()`? What would change if we used `left_join()` instead?
+   
+b. Use `anti_join()` to find visits that have **no** recorded condition. How many are there?
+
+```{r}
+#| label: anti-join-conditions
+
+visits_no_conditions <- anti_join(visit_occurrence, condition_occurrence, by = "visit_occurrence_id")
+
+nrow(visits_no_conditions)
+```
+
+**3.2** Right now, diagnoses are stored as `condition_concept_id` — a numeric code, not a readable term. Join to the `concept` table (the OMOP vocabulary table) to translate these codes into human-readable condition names.
+
+```{r}
+#| label: join-concept-names
+
+concept <- cdm$concept |>
+  collect()
+
+visits_with_condition_names <- visits_with_conditions |>
+  left_join(
+    concept |>
+      select(concept_id, concept_name),
+    by = c("condition_concept_id" = "concept_id")
+  )
+
+visits_with_condition_names |>
+  select(person_id, visit_start_date, concept_name) |>
+  head(10)
+```
+
+**Question:** Why was the join key different on each side (`condition_concept_id` vs. `concept_id`)?
+
+---
+
+# Part 4: Answer a Clinical Question
+
+Using everything you've joined so far, answer the following question:
+
+> **What are the 10 most common diagnoses (by `concept_name`) recorded across all visits in this dataset, and how many unique patients have each one?**
+
+Write a single pipeline that:
+
+1. Starts from `condition_occurrence`
+2. Joins to `concept` to get diagnosis names
+3. Uses `person_id` (already present in `condition_occurrence`) to count **unique patients**, not just rows
+4. Groups by diagnosis name, counts unique patients, and sorts descending
+5. Displays the top 10
+
+```{r}
+#| label: top-diagnoses
+
+# top_diagnoses <- condition_occurrence |>
+#   left_join(...)
+
+# top_diagnoses
+```
+
+
+---
+
+# Part 5: Reflection
+
+Answer briefly (2-3 sentences each):
+
+1. Describe one time in this homework where getting the join **wrong** (wrong key, wrong join type, a silent `.x`/`.y` column collision, or wrong direction) could have silently produced an incorrect answer. How would you catch that mistake?
+2. This dataset only has a handful of tables. Real hospital OMOP CDM databases can have many tables and millions of rows, with even more overlapping column names. What challenges might arise? How do you decide which tables to join?
+
+---
+
+# Submission Instructions
+
+- Submit a rendered `.html` file showing all code, output, and your written answers
+- Make sure all code chunks run **without errors** from a fresh R session (Restart R and Run All before submitting)
+
+::: {.callout-important}
+## Grading note
+Partial credit is available for reasoning shown even if a specific join doesn't run correctly — explain what you *intended* the join to do in a code comment if you get stuck.
+:::
