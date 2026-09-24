@@ -1,0 +1,436 @@
+---
+title: "Healthcare Big Data Analytics"
+subtitle: "Introduction"
+author: "Ben Gerber, MD, MPH"
+date: last-modified
+format:
+  revealjs:
+    smaller: true
+    theme: dracula
+    slide-number: true
+    footer: "Healthcare Big Data Analytics — Introduction"
+    toc: false
+    incremental: false
+    code-fold: false
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| echo: false
+
+library(iglu)
+library(medicaldata)
+library(EHR)
+library(pkdata)
+library(tidyverse)
+```
+
+
+## Welcome (환영합니다)
+
+::: {.incremental}
+- Instructors: Profs. Dong-soo Shin and Ben Gerber
+- Contact: shindong@hallym.ac.kr / ben.gerber@umassmed.edu
+:::
+
+---
+
+## Introductions
+
+Please share:
+
+1. Program / department
+2. Prior work with **R** or coding (none / some / a lot)
+3. Prior work with clinical, electronic health record (EHR), or health data
+4. One thing you hope to learn with our class
+5. Something **fun** you like
+
+---
+
+## Why Healthcare Big Data?
+
+- Lot of EHR (전자건강기록) use and growth of wearable/sensor data
+- Real-world data (RWD) used for clinical, policy, and regulatory decisions
+- Need for researchers who can do:
+  - Clinical data → reproducible analysis → important knowledge
+
+---
+
+## Course Description
+
+> This course provides the basic knowledge and skills to do research with healthcare data — EHRs, wearable device data, and other real-world health data.
+
+By the end, you will be able to:
+
+- Do medical data-driven analysis
+- Manage, clean, and analyze health data in R
+- Understand some clinical coding systems and data standards
+- Apply ethical and reproducible research practices
+
+---
+
+## Course Lessons — Roadmap
+
+::: {.fragment .smaller}
+1. Introduction, research questions, data sources, and tools
+2. Medical data structures and relationships
+3. Data cleaning, wrangling, reshaping, missingness
+4. Coding systems and phenotypes
+5. Cohort construction
+6. Exploratory data analysis
+7. Longitudinal data with wearables
+8. Statistical modeling
+9. Machine learning, prediction
+10. Ethics, privacy, reproducibility
+:::
+
+---
+
+## Tools We'll Use
+
+::: {.columns}
+::: {.column width="50%"}
+**R Language**
+
+- [**R Project**](https://www.r-project.org/) 
+- [**R Studio**](https://posit.co/downloads) as IDE
+:::
+
+::: {.column width="50%"}
+**Reproducibility**
+
+- [**Quarto**](https://quarto.org/) for reproducible reports
+- [**git**](https://git-scm.com/) for version control
+- [**GitHub**](https://github.com/) account for collaboration
+:::
+:::
+
+---
+
+## Workflows for Reproducibility
+
+https://hbiostat.org/rflow/
+
+```{mermaid}
+%%| fig-width: 8
+%%| eval: true
+flowchart TD
+  R[R Workflow] --> Rformat[Report formatting]
+  Rformat --> Quarto["Quarto setup, metadata,<br>table & graph formatting"]
+  R --> DI[Data import] --> Annot["Annotate data<br>(labels, units, data dictionary)"]
+  R --> Do[Data overview] --> F["Observation filtration,<br>missing data patterns"]
+  R --> P[Data processing] --> DP["Recode / transform / reshape /<br>merge / aggregate"]
+  R --> Des["Descriptive statistics<br>(univariate, stratified)"]
+  R --> An["Analysis<br>(stay close to the data)"]
+```
+
+---
+
+## Example De-Identified EHR/ICU (중환자실) Datasets {.scrollable}
+
+| Dataset | Source | Notes |
+|---|---|---|
+| **MIMIC-IV** | Beth Israel Deaconess (Boston, USA) | Hospital admissions 2008–2019 |
+| **eICU-CRD** | Multi-center (USA) | 200,000+ ICU admissions |
+| **AmsterdamUMCdb** | Netherlands | 1st open European ICU database; now in OMOP |
+| **HiRID** | Switzerland | High time-resolution; ~34k patients |
+| **BlendedICU** | Harmonized (Multiple) | 309k+ stays, in OMOP |
+| **CRITICAL** | Multi-site US | 1.95B records, 371K patients, OMOP |
+
+---
+
+## What EHR Data Looks Like After Wrangling
+
+```{r}
+#| label: example-ehr-data-preview
+
+# define directories and read sample data
+checkDir <- file.path(tempdir(), 'check1')
+rawDataDir <- system.file("examples", "str_ex1", package="EHR")
+if (!dir.exists(checkDir)) dir.create(checkDir)
+demo <- read.csv(file.path(rawDataDir,"Demographics_DATA_simple.csv"))
+head(demo, c(6, 7))
+```
+
+---
+
+## What Wearable Data Looks Like (Glucose Monitoring)
+
+```{r}
+#| label: wearable-preview
+#| fig-width: 9
+#| fig-height: 4.5
+
+head(example_data_1_subject)
+plot_glu(example_data_1_subject, plottype = 'tsplot', tz = "EST")
+```
+
+---
+
+## Clinical Coding Systems
+
+| System | Used For |
+|---|---|
+| **ICD** and **KCD** | Diagnoses |
+| **CPT** and **EDI** | Procedures / billing |
+| **LOINC** and **K-LOINC** | Lab & clinical observations |
+| **RxNorm** | Medication vocabularies | 
+| **SNOMED CT** | Clinical terminology / findings |
+| **OMOP CDM** | Common data model |
+
+---
+
+## Prerequisites (선수 과목)
+
+- Basic R (variables, data frames, functions) *or* willingness to catch up quickly :)
+- Introductory statistics (regression, hypothesis testing)
+- No prior clinical/health data experience required
+
+::: {.callout-note}
+No worries about your R experience - we can help!
+:::
+
+---
+
+## Grading Breakdown
+
+```{r}
+#| label: grading-pie
+#| echo: false
+#| fig-width: 8
+#| fig-height: 5
+
+grading <- data.frame(
+  component = c("Homework", "Final Project", "Attendance"),
+  weight = c(40, 40, 20)
+)
+
+ggplot(grading, aes(x = "", y = weight, fill = component)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = paste0(weight, "%")),
+            position = position_stack(vjust = 0.5), color = "white", fontface = "bold", size = 12) +
+  scale_fill_manual(values = c("#2C6E91", "#E07A5F", "#81B29A")) +
+  theme_void() +
+  theme(legend.title = element_blank(), legend.text = element_text(size = 24), legend.position = "right")
+```
+
+---
+
+## Grading Details
+
+**Homework and Process Monitoring — 40%**
+
+- Weekly homework with R
+- Final project check-ins
+
+**Final Project Report and Presentation — 40%**
+
+- Full workflow: research question → cohort → analysis → reproducible report
+- Rubric: research question clarity, analytic rigor, reproducibility, presentation quality
+
+**Attendance — 20%**
+
+- Active participation counts, not just physical presence
+
+---
+
+## Final Project
+
+The capstone of this course: apply the **complete workflow** to a healthcare research question.
+
+::: {.incremental}
+1. Formulate a research question
+2. Construct a cohort from EHR / wearable / public data
+3. Clean, explore, and analyze the data
+4. Apply model
+5. Produce a reproducible report (Quarto + GitHub) including background, aims, methods, results, discussion, limitations
+6. Present findings to the class
+:::
+
+**Milestones:** Proposal (Week ~4) → Analysis Checkpoint (Week ~8) → Final Report & Presentation (TBD)
+
+---
+
+## From Curiosity to a Research Question (연구 질문)
+
+Big medical data doesn't start with data — it starts with a **question worth answering**.
+
+::: {.incremental}
+- A dataset with 50M patients can't help a vague or unanswerable question
+- A common statement: *"I have access to X data, what can I do with it?"* — start from question
+:::
+
+---
+
+## Where Good Questions Come From
+
+::: {.columns}
+::: {.column width="50%"}
+**Clinical / practical sources**
+
+- A pattern you've noticed in practice or reading
+- A guideline with weak evidence behind it
+- Conflicting findings across prior studies
+- A subgroup consistently excluded from trials (elderly or pregnant patients)
+:::
+
+::: {.column width="50%"}
+**Data-driven sources**
+
+- A gap: no one has studied *this* outcome in *this* population
+- A new data source becoming available (e.g., wearables)
+- Replication: does a finding from Population A hold in Population B?
+:::
+:::
+
+---
+
+## The FINER Criteria
+
+A checklist for making a research question:
+
+| Criterion | Ask yourself |
+|---|---|
+| **F**easible | Enough patients, follow-up time, and data quality to answer it? |
+| **I**nteresting | Would you want to know the answer? |
+| **N**ovel | Does it confirm, refute, or extend what's already known? |
+| **E**thical | Can it be done without too much risk or privacy violation? |
+| **R**elevant | Does it matter for clinical practice, policy, or future research? |
+
+---
+
+## Structuring the Question: PECO
+
+Useful for comparative or causal questions:
+
+| Element | Meaning | Example |
+|---|---|---|
+| **P** | Population | Adults newly diagnosed with type 2 diabetes |
+| **E** | Exposure | Initiation of SGLT2 inhibitor |
+| **C** | Comparison | Initiation of metformin monotherapy |
+| **O** | Outcome | Hospitalization for heart failure within 2 years |
+
+**Resulting question:** *"Among adults newly diagnosed with type 2 diabetes, does starting an SGLT2 inhibitor (vs. metformin) lower the risk of heart-failure hospitalization?"*
+
+---
+
+## Not All Questions Are Causal
+
+Big medical data supports several distinct question *types*:
+
+::: {.incremental}
+- **Descriptive** — "What is the prevalence of X in population Y?"
+- **Predictive** — "Can we predict which patients will develop X within N days?"
+- **Comparative effectiveness** — "Does treatment A lead to better outcomes than treatment B?"
+- **Health service use** — "How does access to Y vary by Z (e.g., demographics)?"
+:::
+
+::: {.callout-important}
+Confusing *prediction* with *causal inference* is a common error — a model that predicts risk well does not tell you what to change to reduce it.
+:::
+
+---
+
+## Strengths (장점) of Medical Data
+
+::: {.incremental}
+- **Scale** — millions of patients enable studying rare outcomes or small subgroups
+- **Real-world generalizability** — captures patients excluded from RCTs (elderly, non-adherent)
+- **Longitudinal** — years of follow-up, sometimes across a full lifespan
+- **Speed & cost** — no new data collection required; faster than prospective studies
+- **Naturally occurring variation** — comparative effectiveness research that would be unethical or impractical to randomize
+- **Granularity** — wearables/sensors provide continuous physiological data unavailable in clinic visits
+:::
+
+---
+
+## Limitations (제한점) of Medical Data
+
+::: {.incremental}
+- **Confounding by indication** — sicker patients get certain treatments (bias)
+- **Missing data** — not missing at random; care received *outside* the system is invisible
+- **Measurement error** — codes reflect billing/documentation practices, not always clinical truth
+- **Selection bias** — who's *in* the dataset is rarely a random sample of the population of interest
+- **Immortal time bias** — common pitfall in EHR cohort studies (e.g., statin post-MI)
+- **Generalizability** — single-institution or single-country data may not transport elsewhere
+- **Data heterogeneity** — coding systems and practices shift across sites, time, and countries
+:::
+
+---
+
+## Ethics (윤리), Privacy & Data Governance
+
+- De-identification and date shifting
+- Human subject considerations for secondary use of health data
+- Data use agreements (DUA) when working with real EHR/wearable data
+- Why we use **synthetic data** in this course — realistic structure, no privacy risk
+
+::: {.callout-important}
+These considerations aren't an afterthought — they're a required part of homework and final project.
+:::
+
+---
+
+## Academic Integrity & AI-Use Policy
+
+- Collaboration is encouraged for learning; but submitted work must be your own
+- AI (Copilot, ChatGPT, Claude, Posit Assistant, etc.):
+  - Allowed for debugging/syntax help, **must be disclosed**, not allowed for full assignment generation.
+  - AI-assisted portions of code must be disclosed briefly at the top of your script. 
+  - You are responsible for understanding, and able to explain, any code you submit.
+- All final project code must run reproducibly
+
+---
+
+## Questions?
+
+질문 있으세요?
+
+---
+
+## Installing R
+
+https://www.r-project.org/
+
+---
+
+## Installing R Studio
+
+https://posit.co/downloads
+
+---
+
+## Installing Git
+
+https://git-scm.com/install/
+
+---
+
+## Getting Account on GitHub
+
+https://github.com/signup
+
+---
+
+## Installing Packages
+
+```{r}
+install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+install.packages("medicaldata", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(medicaldata)
+
+glimpse(scurvy)
+```
+
+## Getting Familiar with R Studio
+
+If time available in class, we can review the basics.
+
