@@ -1,0 +1,486 @@
+---
+title: "Healthcare Big Data Analytics"
+subtitle: "Data Cleaning, Recoding, Reshaping, and Missingness"
+author: "Ben Gerber, MD, MPH"
+date: last-modified
+format:
+  revealjs:
+    theme: dracula
+    slide-number: true
+    smaller: true
+    footer: "Data Cleaning & Wrangling"
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Today's Goals
+
+By the end of this lesson, you will be able to:
+
+::: {.incremental}
+- Recognize common **messy patterns** (지저분한) in real-world EHR data
+- **Recode** values into clean categories
+- **Reshape** data between wide and long formats using `pivot_longer()` / `pivot_wider()`
+- Detect **outliers** (이상치) using visual and statistical methods
+- Diagnose **patterns of missingness** using R packages
+:::
+
+---
+
+## Why This Matters
+
+::: {.incremental}
+- Real EHR data is entered by many people and systems over many years — inconsistency is common
+- A model or cohort built on unrecoded, unreshaped, or silently-missing data produces **wrong answers with high confidence**
+- This is typically **75% of the actual time** spent with real health data
+- Cleaning usually happens *before* or *between* joins
+:::
+
+---
+
+# Part 1: A Messy Synthetic Dataset
+
+---
+
+## Let's Make a Mess
+
+We'll make a small OMOP dataset with problems (문제).
+
+```{r}
+#| label: messy-data-setup
+#| echo: false
+
+library(tidyverse)
+
+set.seed(42)
+
+patients <- tibble(
+  person_id = 1:12,
+  sex_raw = c("F", "Female", "M", "male", "F ", "Male",
+              "f", "MALE", "Female", "M", "Unknown", "female"),
+  age = c(45, 62, 71, 38, 55, NA, 29, 84, 150, 66, 41, 58),
+  race_raw = c("White", "WHITE", "Black or African American", "Asian",
+               "black", "white", "Other", "asian", "White", NA,
+               "Black or African American", "Other")
+)
+
+patients
+```
+
+::: {.callout-important}
+What are the problems you see?
+:::
+
+---
+
+## And Some Messy Vitals (Wide Format)
+
+```{r}
+#| label: messy-vitals-setup
+#| echo: false
+
+set.seed(42)
+
+vitals_wide <- tibble(
+  person_id = 1:50,
+  visit_date = as.Date("2023-01-01") + sample(0:300, 50),
+  sbp = sample(80:220, 50, replace = TRUE),
+  dbp = sample(40:100, 50, replace = TRUE),
+  hr = sample(50:120, 50, replace = TRUE)
+)
+
+i <- sample(1:50, 10)
+vitals_wide$sbp[i] <- NA_integer_
+vitals_wide$sbp[5] <- 999L
+vitals_wide$dbp[i] <- NA_integer_
+vitals_wide$hr[7] <- 0L
+
+vitals_wide
+```
+
+::: {.callout-important}
+What are the problems you see?
+:::
+
+---
+
+# Part 2: Recoding Data
+
+---
+
+## The Problem: One Concept, Many Spellings
+
+```{r}
+#| label: sex-raw-counts
+patients |>
+  count(sex_raw)
+```
+
+12 patients, but **10 distinct values** for a variable that should have 2–3 categories.
+
+---
+
+## Recoding with `case_when()`
+
+`case_when()` is a flexible way to recode — evaluates conditions in order, top to bottom:
+
+```{r}
+#| label: recode-case-when
+patients <- patients |>
+  mutate(
+    sex_raw_trimmed = str_trim(sex_raw),
+    sex = case_when(
+      str_to_lower(sex_raw_trimmed) %in% c("f", "female") ~ "Female",
+      str_to_lower(sex_raw_trimmed) %in% c("m", "male")   ~ "Male",
+      TRUE ~ NA_character_
+    )
+  )
+
+patients |>
+  count(sex_raw, sex)
+```
+
+Notice `"Unknown"` correctly falls through to `NA` — we didn't have to list every bad value, just the good ones.
+
+---
+
+## Recoding with `fct_collapse()`
+
+When you're working with a `factor` and renaming levels, `forcats` functions are better:
+
+```{r}
+#| label: recode-fct-collapse
+patients <- patients |>
+  mutate(
+    race_clean = str_to_lower(str_trim(race_raw)),
+    race = fct_collapse(
+      race_clean,
+      "White" = c("white"),
+      "Black or African American" = c("black or african american", "black"),
+      "Asian" = c("asian"),
+      "Other" = c("other")
+    )
+  )
+count(patients, race_raw, race)
+```
+
+::: {.callout-note}
+`fct_collapse()` is good when grouping many raw labels into a few clean categories; `case_when()` is better when for complex logic or more columns at once.
+:::
+
+---
+
+## Recoding Implausible Values (비현실적인 값)
+
+Implausible numbers often need to become missing values (`NA`):
+
+```{r}
+#| label: recode-implausible-age
+patients <- patients |>
+  mutate(age_clean = if_else(age > 0 & age <= 120, age, NA_real_))
+
+patients |>
+  select(person_id, age, age_clean)
+```
+
+::: {.callout-important}
+Never just delete or silently "fix" implausible values — always keep the original column (`age`) alongside the cleaned one (`age_clean`) so your cleaning logic can be checked easily (**reproducible**).
+:::
+
+---
+
+# Part 3: Reshaping Data (Pivoting)
+
+---
+
+## Wide vs. Long: Why It Matters
+
+- **Wide format**: one row per patient/visit, one column per variable (`sbp`, `dbp`, `hr`) — good for reading (like a "flowsheet"), may not be good for many `ggplot2`/modeling functions
+- **Long format**: one row per patient-variable combination — required for faceted plots, mixed models, and many `tidyverse` summary functions
+
+Some raw EHR data start as **wide**; most analysis and graphing functions need **long**.
+
+---
+
+## `pivot_longer()`: Wide → Long
+
+```{r}
+#| label: pivot-longer-example
+vitals_long <- vitals_wide |>
+  pivot_longer(
+    cols = c(sbp, dbp, hr),
+    names_to = "vital_sign",
+    values_to = "value"
+  )
+
+vitals_long |>
+  arrange(person_id) |>
+  head(10)
+```
+
+Each patient-visit now has **3 rows** instead of 1 — one per vital sign.
+
+---
+
+## Show the Plot from Long Data
+
+```{r}
+#| label: plot-long-data
+
+ggplot(vitals_long, aes(x = visit_date, y = value, color = vital_sign)) +
+  geom_point()
+```
+
+::: {.callout-note}
+Do these values look ok to you?
+:::
+
+---
+
+## `pivot_wider()`: Long → Wide
+
+Sometimes you need to go the other direction: preparing a table for a regression model, where each row must be one patient-visit with separate columns:
+
+```{r}
+#| label: pivot-wider-example
+vitals_back_to_wide <- vitals_long |>
+  pivot_wider(
+    names_from = vital_sign,
+    values_from = value
+  )
+
+identical(arrange(vitals_wide, person_id), arrange(vitals_back_to_wide, person_id))
+```
+
+::: {.callout-note}
+`pivot_longer()` and `pivot_wider()` are inverses of each other
+:::
+
+---
+
+## A Realistic Long-Format: Labs Over Time
+
+```{r}
+#| label: labs-long-example
+labs_long <- tibble(
+  person_id = rep(1:3, each = 4),
+  visit_num = rep(1:2, each = 2, times = 3),
+  loinc_name = rep(c("Glucose", "Creatinine", "Glucose", "Creatinine"), 3),
+  value = c(140, 1.0, 160, 1.1,   95, 0.9, 210, 1.3,   130, 1.2, 145, 1.4)
+)
+
+labs_long
+```
+
+## Now Wide-Format: Labs Over Time
+
+```{r}
+#| label: labs-wide-pivot
+labs_wide <- labs_long |>
+  pivot_wider(names_from = loinc_name, values_from = value)
+
+labs_wide
+```
+
+This is common: labs are long (one row per result), but a model predicting an outcome from glucose *and* creatinine needs them side by side, per visit.
+
+---
+
+# Part 4: Detecting Outliers
+
+---
+
+## Visual Detection: Boxplots
+
+```{r}
+#| label: outlier-boxplot
+#| code-fold: true
+#| fig-width: 7
+#| fig-height: 4
+
+ggplot(vitals_wide, aes(x = "", y = sbp)) +
+  geom_boxplot(fill = "#2C6E91", alpha = 0.5) +
+  geom_jitter(width = 0.05, alpha = 0.6) +
+  labs(title = "Systolic Blood Pressure — Outlier Check", x = NULL, y = "SBP (mmHg)") +
+  theme_minimal(base_size = 13)
+```
+
+The points near 1000 are likely in error (perhaps a misplaced decimal) and not real.
+
+---
+
+## Statistical Detection: Z-Scores
+
+```{r}
+#| label: zscore-outlier-detection
+#| code-fold: true
+vitals_wide |>
+  mutate(
+    hr_z = (hr - mean(hr, na.rm = TRUE)) / sd(hr, na.rm = TRUE),
+    hr_outlier = abs(hr_z) > 3
+  ) |>
+  select(person_id, hr, hr_z, hr_outlier)
+```
+
+Z-scores work well for roughly normal distributions but are sensitive to the extreme values themselves inflating the mean/SD — consider IQR as an alternative.
+
+---
+
+## Domain Knowledge
+
+The most reliable "outlier detector" in clinical data is often a **plausibility range**:
+
+```{r}
+#| label: plausibility-flags
+vitals_wide |>
+  mutate(
+    sbp_implausible = sbp < 60 | sbp > 260,
+    hr_implausible  = hr < 30 | hr > 220
+  ) |>
+  select(person_id, sbp, sbp_implausible, hr, hr_implausible)
+```
+
+::: {.callout-important}
+A statistically "normal" value can appear clinically impossible (e.g., DBP = 0), and a statistical "outlier" can be a real value (e.g., a hypertensive crisis). Use both lenses together, and never auto-delete outliers without documenting the rule you used.
+:::
+
+---
+
+# Part 5: Patterns of Missingness (결측)
+
+---
+
+## Why *Patterns* of Missingness (결측) Matter
+
+::: {.incremental}
+- Missing data isn't just "how much" — it's "**which values, and why**"
+- **MCAR** (Missing Completely At Random) — missingness unrelated to any value, observed or not (rare in real EHR data)
+- **MAR** (Missing At Random) — missingness explained by *other observed* variables (e.g., labs missing more often for outpatient than inpatient visits, so encounter type explains missingness)
+- **MNAR** (Missing Not At Random) — missingness related to the *unobserved value itself* (e.g., a lab measure of alcohol or drug screen is only present when clinician thinks needed)
+:::
+
+::: {.callout-important}
+EHR data is very often **MAR or MNAR**, not MCAR — visit type, site, and even disease severity can affect whether something was measured at all.
+:::
+
+---
+
+## Make a Big Vital Sign Dataset
+
+```{r}
+#| label: make-big-vital-sign
+#| echo: false
+n <- 100
+
+vitals_wide_big <- tibble(
+  person_id = 1:n,
+  visit_date = as.Date("2023-01-01") + sample(0:365, n, replace = TRUE),
+  sbp = rnorm(n, mean = 128, sd = 15),
+  dbp = rnorm(n, mean = 80, sd = 10),
+  hr  = rnorm(n, mean = 75, sd = 12)
+)
+
+bp_missing_idx <- sample(1:n, size = 15)  # ~15% of visits missing BP entirely
+
+vitals_wide_big <- vitals_wide_big |>
+  mutate(
+    sbp = if_else(person_id %in% bp_missing_idx, NA_real_, sbp),
+    dbp = if_else(person_id %in% bp_missing_idx, NA_real_, dbp)
+  )
+
+hr_missing_idx <- sample(setdiff(1:n, bp_missing_idx), size = 10)
+
+vitals_wide_big <- vitals_wide_big |>
+  mutate(hr = if_else(person_id %in% hr_missing_idx, NA_real_, hr))
+
+vitals_wide_big
+```
+
+---
+
+## Visualizing Missingness with `naniar`
+
+```{r}
+#| label: naniar-vis-miss
+#| eval: true
+#| fig-width: 7
+#| fig-height: 4
+
+# install.packages("naniar")
+library(naniar)
+
+vitals_wide_big |>
+  vis_miss()
+```
+
+`vis_miss()` gives a quick heatmap-style overview: which columns have missing data, and roughly how much. Are there any patterns?
+
+---
+
+## Summarizing Missingness by Variable
+
+```{r}
+#| label: naniar-miss-var-summary
+#| eval: true
+
+vitals_wide_big |>
+  miss_var_summary()
+```
+
+This gives exact counts and percentages per column.
+
+---
+
+## Visualizing Missingness Patterns Together
+
+```{r}
+#| label: naniar-upset
+#| eval: true
+#| warning: false
+
+library(naniar)
+
+# shows which COMBINATIONS of variables tend to be missing together
+vitals_wide_big |>
+  gg_miss_upset()
+```
+
+Useful when multiple variables are missing — reveals whether missingness occurs **together** vs. **independently**.
+
+---
+
+## VIM Package for Missingness: histMiss
+
+```{r}
+#| label: vim-hist
+
+library(VIM)
+
+histMiss(vitals_wide_big[, c("sbp", "dbp", "hr")], only.miss = FALSE, interactive = FALSE)
+```
+
+---
+
+## What NOT to Do (하지 마세요)
+
+::: {.incremental}
+- **Don't** silently drop all rows with any missing value (`na.omit()`/`drop_na()`) without first checking *how much* data that removes and *whether* it's random
+- **Don't** assume a missing lab means "normal" or impute (replace with) a placeholder value without justification
+- **Don't** treat 0, 999, -1, etc. as if they were real numeric values — always check for these before summarizing
+:::
+
+---
+
+## Recap
+
+::: {.incremental}
+- **Recoding** (`case_when()`, `fct_collapse()`, `recode_values()`) turns inconsistent raw categories into clean, analyzable ones — always keep the raw column alongside the cleaned one
+- **Reshaping** (`pivot_longer()` / `pivot_wider()`) moves data between the shape it arrives in and the shape your analysis needs — they're inverses of each other
+- **Outliers** should be flagged using both statistical rules (e.g., z-score) *and* domain plausibility — neither alone is sufficient
+- **Missingness** has *patterns*, not just a percentage — check whether it relates to other variables before deciding how to handle it (`naniar`)
+:::
+
+
