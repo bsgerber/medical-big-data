@@ -1,0 +1,98 @@
+---
+title: "Homework: Grouping Diagnoses in a Mock OMOP CDM"
+subtitle: "Big Medical & Health Data with R"
+author: "이름"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: false
+execute:
+  echo: true
+  eval: false
+  warning: false
+  message: false
+---
+
+## Assignment Overview
+
+**Goal:** Practice grouping clinical facts by diagnosis using a fake OMOP CDM, then verify one diagnosis code's hierarchy in **Athena**.
+
+You will:
+
+1. Build a mock OMOP CDM in R (`omock` + `CDMConnector`)
+2. Group `condition_occurrence` records by diagnosis (`concept_name`)
+3. Look up one diagnosis in Athena and find its descendant concepts
+4. Re-run your grouping using the full descendant set (a mini phenotype!)
+
+## Step 0 — Setup
+
+Note data is less than 1 GB download.
+
+```{r}
+#| label: setup
+# install.packages(c("omock", "CDMConnector", "dplyr"))
+library(omock)
+library(CDMConnector)
+library(dplyr)
+
+# Build a mock CDM from the synthea-heart-10k fake dataset
+cdm <- mockCdmFromDataset(datasetName = "synthea-heart-10k", source = "duckdb")
+
+cdm$condition_occurrence
+cdm$concept
+```
+
+`cdm` behaves like a named list of tables (`person`, `condition_occurrence`, `concept`, ...).
+
+## Task 1 — Group by Diagnosis
+
+Join `condition_occurrence` to `concept` on `condition_concept_id = concept_id`, then count records **and** distinct patients per diagnosis. Order results by most frequent conditions.
+
+```{r}
+#| label: task1-starter
+diagnosis_counts <- cdm$condition_occurrence |>
+  left_join(
+    cdm$concept,
+    by = c("condition_concept_id" = "concept_id")
+  ) |>
+  group_by(concept_name) |> 
+  summarise( # can also use reframe
+    n_records  = n(),
+    n_patients = n_distinct(person_id)
+  ) |>
+  collect()
+
+diagnosis_counts |>
+  arrange(desc(n_records))
+```
+
+> **Q1:** Which diagnosis has the most records? Does it also have the most distinct patients? Why might those two rankings differ in other data sources?
+
+## Task 2 — Athena + Hierarchy
+
+1. Pick **one** diagnosis from your Task 1 table
+2. Look it up on <https://athena.ohdsi.org> — search the `concept_name`
+3. Record its `concept_id`, `vocabulary_id`, and `standard_concept` flag
+4. Open its **"View Details" → Relationships/Hierarchy** tab and list 2–3 **descendant** concepts
+
+```{r}
+#| label: task2-starter
+# TODO: replace with the concept_id you found on Athena, an "ancestor" that has descendants (use cdm$concept_ancestor for possible choices)
+my_concept_id <- 441840
+
+descendants <- cdm$concept_ancestor |>
+  filter(ancestor_concept_id == my_concept_id) |>
+  pull(descendant_concept_id)
+
+# Re-run Task 1's grouping, but now include the diagnosis AND all its descendants
+cdm$condition_occurrence |>
+  filter(condition_concept_id %in% c(my_concept_id, descendants)) |>
+  summarise(n_records = n(), n_patients = n_distinct(person_id)) |>
+  collect()
+```
+
+> **Q2:** Are the n_records and n_patients different now? Why? And what does that imply for a real phenotype definition that only used one exact code?
+

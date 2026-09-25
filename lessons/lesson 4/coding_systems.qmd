@@ -1,0 +1,298 @@
+---
+title: "Clinical Coding Systems & Computable Phenotypes"
+subtitle: "ICD, CPT, LOINC, SNOMED CT, and the OMOP CDM"
+author: "Ben Gerber, MD, MPH"
+date: last-modified
+format:
+  revealjs:
+    theme: dracula
+    slide-number: true
+    footer: "Big Medical & Health Data with R"
+    chalkboard: true
+    smaller: true
+    code-line-numbers: true
+    incremental: false
+    width: 1280
+    height: 720
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Today's Agenda
+
+1. Why coding systems matter: from raw data to **phenotypes**
+2. The major coding systems: **ICD, CPT, LOINC, SNOMED CT**
+3. Hierarchies: how codes relate to each other
+4. The **OMOP Common Data Model** and standardized vocabularies (**Athena**)
+5. Korean adaptations: **KCD, EDI, K-OMOP**
+6. Hands-on: querying a mock vocabulary hierarchy in R
+7. Reference websites for code look-up
+
+## Learning Objectives
+
+By the end of this lesson, you should be able to:
+
+- Distinguish diagnosis codes (ICD), procedure codes (CPT/HCPCS), lab/observation codes (LOINC), and clinical terminology (SNOMED CT)
+- Explain why hierarchical structure matters for defining phenotypes
+- Describe the role of the OMOP CDM and its standardized vocabularies
+- Navigate Athena to look up a concept and its ancestors/descendants
+- Describe how Korean vocabularies (KCD, EDI) are mapped into OMOP
+
+# 1. From Codes to Phenotypes
+
+## Why This Matters
+
+Electronic health records and claims data are **coded** as structured data, not written in free text (mostly).
+
+Free text from progress notes require NLP/LLMs - considered separately.
+
+> A **phenotype** is an operational definition of a clinical concept (e.g., "Type 2 Diabetes") built from combinations of codes, values, and rules applied to structured data.
+
+- Codes are the atoms; phenotypes are the molecules
+- Getting the codes and hierarchy right makes a more valid and less biased cohort
+- Multi-site / multi-country research (e.g., US + Korea) requires **mapping** between local and international vocabularies
+
+## The Landscape
+
+```{mermaid}
+flowchart LR
+  A[Patient Encounter] --> B[Diagnosis\nICD-10 / ICD-10-CM / KCD]
+  A --> C[Procedure\nCPT / HCPCS / EDI]
+  A --> D[Lab / Observation\nLOINC]
+  A --> E[Clinical finding\nSNOMED CT]
+  B --> F[(OMOP CDM\nStandardized Vocabularies)]
+  C --> F
+  D --> F
+  E --> F
+  F --> G[Computable Phenotype /\nCohort Definition]
+```
+
+# 2. Major Coding Systems
+
+## ICD — International Classification of Diseases
+
+- Maintained by **WHO**; primary use: diagnoses, mortality statistics, reimbursement
+- Key versions:
+  - **ICD-9-CM** — legacy, US, retired for most uses
+  - **ICD-10** — WHO version, used internationally for mortality/morbidity
+  - **ICD-10-CM** — US clinical modification, much more granular
+  - **ICD-11** — current WHO version, fully hierarchical, multi-axial
+- Structure: category + etiology/anatomic site/severity/laterality + extension
+- Example: `E11.9` = Type 2 diabetes mellitus without complications
+
+## ICD Hierarchy Example
+
+```{mermaid}
+flowchart TD
+  A["Chapter IV: Endocrine, nutritional,\nand metabolic diseases (E00-E90)"] --> B["E08-E13: Diabetes mellitus"]
+  B --> C["E11: Type 2 diabetes mellitus"]
+  C --> D["E11.9: ...without complications"]
+  C --> E["E11.2-: ...with kidney complications"]
+  C --> F["E11.3-: ...with ophthalmic complications"]
+```
+
+A **phenotype algorithm** for "Type 2 Diabetes" may use `E11.*` parent plus all descendants
+
+## CPT — Current Procedural Terminology
+
+- Maintained by the **American Medical Association (AMA)**
+- Describes **what was done**: procedures, services, surgeries
+- 5-digit numeric codes, organized into categories:
+  - Category I: routine clinical procedures (e.g., `99213` office visit)
+  - Category II: performance measurement (optional, alphanumeric)
+  - Category III: emerging/experimental technology (temporary codes)
+- Often paired with **HCPCS Level II** codes (supplies, drugs, DME) in US claims data
+- CPT is **proprietary/licensed** — unlike ICD or LOINC
+
+Examples: 90999 for dialysis in facility, and S9339 for peritoneal dialysis at home
+
+## LOINC — Logical Observation Identifiers Names and Codes
+
+- Maintained by the **Regenstrief Institute**
+- Standardizes **lab tests, clinical measurements, and observations**
+- Each code is defined by **six axes**:
+
+| Axis | Example |
+|---|---|
+| Component | Glucose |
+| Property | Mass concentration |
+| Timing | Point in time |
+| System | Serum/Plasma |
+| Scale | Quantitative |
+| Method | (optional, e.g., "test strip") |
+
+- Example: `2345-7` = Glucose \[Mass/volume\] in Serum or Plasma (random)
+
+## SNOMED CT
+
+- Maintained by **SNOMED International**; most comprehensive clinical terminology
+- Covers diagnoses, findings, procedures, body structures, organisms, and more 
+- Concepts are linked by **formal relationships**, not just hierarchy:
+  - `Is a` (hierarchical parent/child)
+  - `Finding site`, `Causative agent`, `Associated morphology`, etc.
+
+Example: "Bacterial pneumonia" 
+
+- Is a: Pneumonia
+- Is a: Bacterial infectious disease
+- Finding site: Lung structure
+- Causative agent: Bacterium
+- Associated morphology: Inflammation
+
+## SNOMED CT "Is a" Hierarchy Example
+
+```{mermaid}
+flowchart TD
+  A["Clinical finding"] --> B["Disease"]
+  B --> C["Disorder of endocrine system"]
+  C --> D["Disorder of glucose metabolism"]
+  D --> E["Diabetes mellitus"]
+  E --> F["Type 2 diabetes mellitus"]
+  F --> G["Type 2 diabetes mellitus\nwith diabetic nephropathy"]
+```
+
+Each concept can also carry defining attributes, e.g. `Type 2 diabetes mellitus with diabetic nephropathy` → `Associated morphology = Nephropathy`, `Finding site = Kidney structure`.
+
+# 3. Hierarchies in Practice
+
+## Why Hierarchy Matters for Phenotyping
+
+- Clinicians *rarely* code with a single, most-specific term consistently
+- A phenotype for "diabetes" likely needs **all descendants** of the diabetes concept
+- Two core hierarchy operations:
+  - **Ancestors**: broader/parent concepts 
+  - **Descendants**: narrower/child concepts
+
+## A Tiny Mock Hierarchy in R
+
+```{r}
+#| label: mock-hierarchy
+# A minimal parent-child edge list, similar in spirit to
+# OMOP's concept_ancestor table (but built by hand here)
+edges <- tibble::tribble(
+  ~parent,                     ~child,
+  "Diabetes mellitus",         "Type 2 diabetes mellitus",
+  "Type 2 diabetes mellitus",  "T2DM without complications",
+  "Type 2 diabetes mellitus",  "T2DM with nephropathy",
+  "T2DM with nephropathy",     "T2DM with nephropathy, stage 3 CKD"
+)
+
+edges
+```
+
+# 4. The OMOP Common Data Model
+
+## What Is OMOP CDM?
+
+- **OMOP** = Observational Medical Outcomes Partnership; the data model is now stewarded by **OHDSI** (Observational Health Data Sciences and Informatics)
+- A relational schema that any clinical/claims dataset can be transformed (ETL) into tables
+- Core clinical tables: `person`, `condition_occurrence`, `drug_exposure`, `procedure_occurrence`, `measurement`, `observation`, `visit_occurrence`
+- Every clinical fact is expressed using a **standard concept_id**, regardless of the source vocabulary
+
+## Standard vs. Source Concepts
+
+- Every code from ICD, CPT, LOINC, KCD, EDI, etc. becomes a row in the `concept` table
+- Each concept has a `standard_concept` flag:
+  - `"S"` — Standard: concept to use for analysis
+  - `NULL`/blank — Non-standard: kept for traceability, mapped to a standard concept
+  - `"C"` — Classification concept (used for grouping, not for analyses)
+- Non-standard source codes are linked to standard concepts via a `"Maps to"` relationship
+
+```{mermaid}
+flowchart LR
+  A["Source code\ne.g. ICD-10-CM E11.9\n(non-standard)"] -- "Maps to" --> B["Standard concept\nSNOMED CT: Type 2 diabetes mellitus"]
+  B -- "Is a" --> C["Ancestor concept\nDiabetes mellitus"]
+```
+
+## Key OMOP Vocabulary Tables
+
+| Table | Purpose |
+|---|---|
+| `concept` | One row per code/term across all vocabularies |
+| `vocabulary` | Registry of vocabularies (ICD10CM, LOINC, SNOMED, KCD7, EDI, ...) |
+| `concept_relationship` | Pairwise relationships, e.g. "Maps to", "Is a" |
+| `concept_ancestor` | *All* ancestor–descendant pairs (with levels of separation) |
+| `domain` | Which table a concept belongs to (Condition, Drug, Procedure...) |
+
+## Athena: The OHDSI Vocabulary Browser
+
+- **Athena** (<https://athena.ohdsi.org>) hosts every vocabulary OHDSI supports — ICD, CPT4, LOINC, SNOMED CT, RxNorm, etc.
+- Typical workflow:
+  1. Search a term or code
+  2. Inspect its domain, standard/non-standard status, and vocabulary
+  3. View **relationships** ("Maps to", "Is a") and **hierarchy** (ancestors/descendants)
+  4. Download a full vocabulary snapshot (CSV) for local work if needed
+
+# 5. Phenotyping with Coded Data
+
+## A Computable Phenotype
+
+A "Type 2 Diabetes" cohort might be defined as:
+
+> Patients with **≥2 condition_occurrence records** mapped to any **descendant of concept_id 1002** (T2DM) that are **standard concepts**, **at least 30 days apart**, OR **≥1 record plus a diabetes drug exposure**
+
+## Phenotype Libraries & Tools
+
+- **OHDSI ATLAS** (<https://atlas-demo.ohdsi.org>) — web tool to build, share, and run cohort definitions across sites without sharing patient data
+- **OHDSI Phenotype Library** — community-vetted, validated phenotype definitions
+- **PheKB** (<https://phekb.org>) — algorithms combining codes, labs, and NLP for phenotyping
+- Good practice: always version and document your code sets (which vocabulary version, which concept_ids, which logic)
+
+# 6. Korean Adaptations
+
+## KCD — Korean Standard Classification of Diseases
+
+- Built on **ICD-10**, extended for Korean healthcare system
+- Used for medical records, cause-of-death statistics, and insurance claims
+- Current edition: **KCD-9**
+- Look-up: KOICD portal — <https://www.koicd.kr/kcd/kcds.do>
+- In OMOP, `KCD7`/`KCD8` are loaded as **non-standard** vocabularies, and `"Maps to"` **SNOMED CT** standard concepts
+
+## EDI Codes — Korea's Claims/Procedure Vocabulary
+
+- From **HIRA** for national health insurance reimbursement
+- Cover procedures, medical services, devices, and drugs used in claims, similar to **CPT + HCPCS** in the US
+- The **full EDI code set has been incorporated into the OMOP vocabulary** (via Athena)
+- EDI concepts are loaded as **non-standard**; map to standard concepts for analysis
+
+## Korean OMOP CDM Networks (K-OMOP)
+
+- Korea has one of the most active **OHDSI communities** outside the US (**K-OHDSI**)
+- National-scale conversions to OMOP CDM:
+  - **HIRA K-OMOP** — nationwide claims data converted to OMOP by mapping EDI → OMOP standard concepts
+  - Multiple university hospitals and NHIS-linked databases participate in **multi-site OHDSI network studies**
+- Korean data be analyzed with the **same R/ATLAS tools** used elsewhere
+
+# Reference Websites for Code Look-Up
+
+## International Systems
+
+- **ICD-10-CM** (US): <https://www.cdc.gov/nchs/icd/icd10cm.htm>
+- **ICD-11** (WHO): <https://icd.who.int/>
+- **CPT** (AMA, license required): <https://www.ama-assn.org/topics/cpt-codes>
+- **LOINC** search: <https://loinc.org/search/>
+- **SNOMED CT browser** (IHTSDO): <https://snomedbrowser.org/>
+- **RxNorm** (drugs, NLM): <https://mor.nlm.nih.gov/RxNav/>
+
+## OMOP / OHDSI
+
+- **Athena** vocabulary browser & downloads: <https://athena.ohdsi.org/>
+- **OHDSI** homepage & community forums: <https://www.ohdsi.org/> and <https://forums.ohdsi.org/>
+- **ATLAS** demo (cohort builder): <https://atlas-demo.ohdsi.org/>
+- **OMOP CDM specification** (current): <https://ohdsi.github.io/CommonDataModel/>
+- **PheKB** phenotype library: <https://phekb.org/>
+
+## Korean Vocabularies
+
+- **KOICD** (KCD look-up): <https://www.koicd.kr/kcd/kcds.do>
+- **HIRA** (EDI codes, claims rules): <https://www.hira.or.kr/>
+- **OHDSI Korea (K-OHDSI)** forum posts on EDI/KCD integration: <https://forums.ohdsi.org/>
+
+## Summary
+
+- Diagnoses (**ICD/KCD**), procedures (**CPT/EDI**), labs (**LOINC**), and clinical concepts (**SNOMED CT**) have different purposes and structures
+- Hierarchy (parent/child, ancestor/descendant) turns single code into usable **phenotype definition**
+- **OMOP CDM + Athena** unify into one queryable structure, distinguishing **standard** vs. **source** concepts
+- Korea's **KCD** and **EDI** vocabularies are now integrated into OMOP/Athena, for **Korean data to plug into international network research** with the same R tools
