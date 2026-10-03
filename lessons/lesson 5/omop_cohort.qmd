@@ -1,0 +1,303 @@
+---
+title: "OMOP CDM and Cohort Creation"
+subtitle: "Going Deep into OMOP"
+author: "Ben Gerber, MD, MPH"
+date: last-modified
+format:
+  revealjs:
+    theme: dracula
+    slide-number: true
+    footer: "Big Medical Data with R"
+    chalkboard: true
+    smaller: true
+    code-line-numbers: true
+    incremental: false
+    width: 1280
+    height: 720
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Today's Agenda
+
+1. Creating a CDM reference
+2. Exploring OMOP CDM
+3. Identifying patient characteristics
+4. Adding cohorts to the CDM
+5. Working with cohorts
+
+# 1. Creating a CDM reference
+
+## OMOP CDM
+
+The OMOP CDM standardizes the structure of healthcare data. Data is stored across a system of tables with established relationships between them (relational database / 관계형 DB).
+
+Here is version 5.4 of OMOP CDM (Version 5.5 was released in August 2026):
+
+https://ohdsi.github.io/CommonDataModel/cdm54erd.html
+
+## Reference to the OMOP CDM
+
+- We will create a data model in R to represent the OMOP CDM.
+- This can provide a basis for analytic pipelines using the data.
+- Our `cdm` object contains references to all the OMOP CDM tables (note version of this test CDM).
+
+Note that here we have first created a local version of the `cdm` with all the tables of interest with `omock` (`cdm_local`), then copied it to a `DuckDB` database, and finally created a reference to it with `CDMConnector`, so that we can work with the final `cdm` object as we normally would for one created with our own healthcare data. This is a database-backed reference for fast/optimized SQL queries (similar to real OMOP instance).
+
+```{r}
+#| label: create-cdm-reference
+#| code-fold: true
+
+library(duckdb)
+library(tidyverse)
+library(omock)
+library(CDMConnector)
+library(omopgenerics)
+library(CohortConstructor)
+library(CohortCharacteristics)
+
+cdm_local <- mockCdmReference() |>
+  mockPerson(nPerson = 100) |>
+  mockObservationPeriod() |>
+  mockConditionOccurrence() |>
+  mockDrugExposure() |>
+  mockObservation() |>
+  mockMeasurement() |>
+  mockVisitOccurrence() |>
+  mockProcedureOccurrence()
+
+con <- dbConnect(drv = duckdb())
+src <- dbSource(con = con, writeSchema = "main")
+
+cdm <- insertCdmTo(cdm = cdm_local, to = src)
+
+cdm
+
+cdm$cdm_source |>
+  pull(cdm_version)
+```
+
+## Accessing a Table
+
+- You can access specific tables using the “$” or “[[ … ]]” operators (extraction). Did you know single and double brackets are functions (함수)?
+
+The `person` table has demographic and identity information (1:1 relationship with patient).
+
+The `observation_period` defines a time window when clinical data is complete and available (when a patient is in observation).
+
+```{r}
+#| label: accessing-table
+
+cdm$person
+
+cdm[["observation_period"]]
+```
+
+# 2. Working with Mock Data
+
+## Use Mock COVID-19 Data
+
+We'll try using the COVID-19 fake dataset. This data can be relatively large in size.
+
+```{r}
+#| label: get-covid-data
+
+cdm <- mockCdmFromDataset(datasetName = "synthea-covid19-10k", source = "duckdb")
+
+cdm
+```
+
+## Counting People
+
+How many people are in this dataset? And how many by gender?
+
+```{r}
+#| label: counting-people
+#| code-fold: true
+
+cdm$person |>
+  count()
+
+cdm$person |>
+  group_by(gender_concept_id) |>
+  count() |>
+  left_join(cdm$concept, by = c("gender_concept_id" = "concept_id")) |>
+  select("gender_concept_id", "concept_name", "n") |>
+  collect()
+```
+
+
+## Summarizing Observation Periods
+
+- The observation period table contains records showing spans of time over which clinical events are observed for the people in the person table. 
+- Someone can potentially have multiple observation periods. 
+
+Let's count number of people grouped by the year during which their first observation period started.
+
+```{r}
+#| label: summarize-observation-periods
+#| code-fold: true
+
+first_observation_period <- cdm$observation_period |>
+  group_by(person_id) |>
+  arrange(observation_period_start_date) |>
+  filter(row_number() == 1) |> # can also use "slice"
+  compute() # keep in db as opposed to collect()
+
+# add to the person table
+first_records_per_year <- cdm$person |>
+  left_join(first_observation_period, by = "person_id") |>
+  mutate(observation_period_start_year = get_year(observation_period_start_date)) |>
+  group_by(observation_period_start_year) |>
+  count() |>
+  collect()
+
+tail(first_records_per_year)
+```
+
+## First Year Observations Plotted
+
+```{r}
+#| label: first-year-observations-plot
+#| code-fold: true
+
+ggplot(first_records_per_year) +
+  geom_col(mapping = aes(x = observation_period_start_year, y = n)) +
+  theme_bw()
+
+```
+
+## Counts of COVID Symptoms
+
+For a group of codes, get counts of those COVID symptoms. (For example, 437663 is fever - can you verify?)
+
+```{r}
+#| label: counts-covid-symptoms
+#| code-fold: true
+
+codes <- c(
+  437663, 437390, 31967, 4289517, 4223659,
+  312437, 434490, 254761, 77074
+)
+
+symptoms_records <- cdm$condition_occurrence |>
+  filter(condition_concept_id %in% codes) |>
+  group_by(condition_concept_id) |>
+  count() |>
+  left_join(cdm$concept |>
+              select(condition_concept_id = concept_id, condition_concept_name = concept_name),
+            by = "condition_concept_id"
+  ) |>
+  collect()
+
+ggplot(symptoms_records) +
+  geom_col(mapping = aes(x = condition_concept_name, y = n)) +
+  theme_bw() +
+  xlab("Symptom")
+```
+
+# 3. Adding OMOP CDM Cohorts
+
+## What is a cohort (코호트)?
+
+- When conducting research using the OMOP CDM, we may want to identify groups of people who share specific characteristics. 
+- The inclusion criteria for these groups can range from simple to complex.
+
+**Simple:** diagnosed with asthma
+
+**Complex:** diagnosed with asthma AND:
+
+- adult age 18+
+- at least 1 year of observation before diagnosis
+- no prior history of chronic obstructive pulmonary disease (COPD)
+- no history of using short-acting beta-antagonists medication
+
+## OMOP Cohort
+
+The groups of people we identify are called cohorts. In the OMOP CDM, cohorts use a specific structure: a cohort table with four required fields:
+
+1. `cohort_definition_id` a unique ID for each cohort (multiple cohorts can be defined in the same cohort table).
+2. `subject_id` a foreign key linking subject to the person table.
+3. `cohort_start_date` date indicating the beginning of the cohort record.
+4. `cohort_end_date` date indicating the end of the cohort record.
+
+Individuals must be defined in the person table and under observation (i.e. have an ongoing record in the observation period table). 
+
+Individuals can enter a cohort multiple times, but the time periods cannot overlap.
+
+## Atlas
+
+ATLAS is an OHDSI tool to conduct analyses with OMOP CDM. 
+
+https://atlas-demo.ohdsi.org
+
+You can create cohorts by defining groups of people based on an exposure to a drug or diagnosis. 
+
+**Concept Sets:** allow for groups of `concept_id`s to define clinical concepts for a research question and can be reused and shared.
+
+**Cohort Definitions:** create a set of persons who satisfy criteria over time, used in analyses, and can be defined based on entry event (first occurrence or inclusion criteria)
+
+**Characterizations:** analytic capability to look at 1 or more cohorts and summarize characteristics
+
+## COVID Cohort
+
+Using the `CohortConstructor` package we can make a cohort of people with COVID-19.
+
+Atlas will help us find a concept set to use:
+
+https://atlas-demo.ohdsi.org/#/concept/37311061
+
+```{r}
+#| label: make-covid-cohort
+
+cdm$covid <- conceptCohort(
+  cdm = cdm,
+  conceptSet = list("covid" = 37311061),
+  name = "covid"
+)
+
+cdm$covid
+```
+
+## Apply Inclusion Criteria
+
+What if we want to limit by dates? Or demographics?
+
+```{r}
+#| label: apply-inclusion-criteria
+#| code-fold: true
+
+cdm$covid <- cdm$covid |>
+  requireInDateRange(dateRange = c(as.Date("2021-01-01"), NA)) 
+
+cdm$covid <- cdm$covid |>
+  requireDemographics(ageRange = c(18, 64), sex = "Male") 
+
+cdm$covid |>
+  count()
+```
+
+## Summary of Inclusion/Exclusion Criteria
+
+```{r}
+#| label: summary-criteria
+#| code-fold: true
+
+attrition_summary <- summariseCohortAttrition(cohort = cdm$covid)
+tableCohortAttrition(attrition_summary)
+```
+
+## Close Up!
+
+```{r}
+#| label: close-up
+
+cdmDisconnect(cdm)
+```
+
+
+
+
+
