@@ -7,7 +7,7 @@ format:
   revealjs:
     theme: dracula
     slide-number: true
-    footer: "Big Medical & Health Data with R"
+    footer: "Big Medical Data with R"
     chalkboard: true
     smaller: true
     code-line-numbers: true
@@ -57,16 +57,17 @@ Free text from progress notes require NLP/LLMs - considered separately.
 ## The Landscape
 
 ```{mermaid}
+%%| eval: true
 flowchart LR
-  A[Patient Encounter] --> B[Diagnosis\nICD-10 / ICD-10-CM / KCD]
-  A --> C[Procedure\nCPT / HCPCS / EDI]
-  A --> D[Lab / Observation\nLOINC]
-  A --> E[Clinical finding\nSNOMED CT]
-  B --> F[(OMOP CDM\nStandardized Vocabularies)]
+  A[Patient Encounter] --> B["Diagnosis<br>ICD-10 / ICD-10-CM / KCD"]
+  A --> C["Procedure<br>CPT / HCPCS / EDI"]
+  A --> D["Lab / Observation\nLOINC"]
+  A --> E["Clinical finding<br>SNOMED CT"]
+  B --> F["(OMOP CDM<br>Standardized Vocabularies)"]
   C --> F
   D --> F
   E --> F
-  F --> G[Computable Phenotype /\nCohort Definition]
+  F --> G["Computable Phenotype /<br>Cohort Definition"]
 ```
 
 # 2. Major Coding Systems
@@ -86,7 +87,7 @@ flowchart LR
 
 ```{mermaid}
 flowchart TD
-  A["Chapter IV: Endocrine, nutritional,\nand metabolic diseases (E00-E90)"] --> B["E08-E13: Diabetes mellitus"]
+  A["Chapter IV: Endocrine, nutritional,<br>and metabolic diseases (E00-E90)"] --> B["E08-E13: Diabetes mellitus"]
   B --> C["E11: Type 2 diabetes mellitus"]
   C --> D["E11.9: ...without complications"]
   C --> E["E11.2-: ...with kidney complications"]
@@ -150,7 +151,7 @@ flowchart TD
   C --> D["Disorder of glucose metabolism"]
   D --> E["Diabetes mellitus"]
   E --> F["Type 2 diabetes mellitus"]
-  F --> G["Type 2 diabetes mellitus\nwith diabetic nephropathy"]
+  F --> G["Type 2 diabetes mellitus<br>with diabetic nephropathy"]
 ```
 
 Each concept can also carry defining attributes, e.g. `Type 2 diabetes mellitus with diabetic nephropathy` → `Associated morphology = Nephropathy`, `Finding site = Kidney structure`.
@@ -202,8 +203,8 @@ edges
 
 ```{mermaid}
 flowchart LR
-  A["Source code\ne.g. ICD-10-CM E11.9\n(non-standard)"] -- "Maps to" --> B["Standard concept\nSNOMED CT: Type 2 diabetes mellitus"]
-  B -- "Is a" --> C["Ancestor concept\nDiabetes mellitus"]
+  A["Source code<br>e.g. ICD-10-CM E11.9<br>(non-standard)"] -- "Maps to" --> B["Standard concept<br>SNOMED CT: Type 2 diabetes mellitus"]
+  B -- "Is a" --> C["Ancestor concept<br>Diabetes mellitus"]
 ```
 
 ## Key OMOP Vocabulary Tables
