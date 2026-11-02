@@ -1,0 +1,895 @@
+---
+title: "Survival Analysis in R"
+subtitle: "R을 이용한 생존 분석"
+author: "Ben Gerber, MD, MPH"
+date: last-modified
+format:
+  revealjs:
+    smaller: true
+    theme: simple
+    slide-number: true
+    chalkboard: true
+    preview-links: auto
+    footer: "Survival Analysis in R"
+    code-fold: true
+    code-summary: "Show code"
+    code-line-numbers: false
+    incremental: false
+    toc: false
+    fig-width: 9
+    fig-height: 4.5
+    fig-align: center
+    include-in-header:
+      - text: |
+          <style>
+          .reveal .ko {
+            font-family: "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+            font-size: 0.75em;
+            color: #1f5f8b;
+            border-left: 4px solid #1f5f8b;
+            padding: 0.1em 0 0.1em 0.6em;
+            margin: 0 0 0.4em 0;
+          }
+          .reveal .ko p { margin: 0; }
+          .reveal .small-table { font-size: 0.85em; }
+          </style>
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+library(survival)
+library(lubridate)
+library(ggsurvfit)
+library(gtsummary)
+```
+
+## Why Survival Analysis for EHR Data?
+
+::: ko
+EHR 데이터는 대부분 '사건 발생까지의 시간' 구조이며, 핵심 과제는 중도절단(censoring)입니다.
+:::
+
+EHR-derived cohorts are built almost entirely from **time-to-event** structures:
+
+- Time from diagnosis code to first prescription
+- Time from hospital discharge to readmission or death
+- Time from starting a medication (e.g., a statin) to a lab value crossing a threshold (e.g., HbA1c ≥ 6.5% = new diabetes)
+- Time from an index visit to the next follow-up encounter
+
+::: {.fragment}
+**The core challenge**: patients leave the data before we observe their outcome — they transfer care, change insurance, or the data extract simply ends. This is **censoring**, and it is the defining feature of EHR follow-up time.
+:::
+
+::: aside
+Credit: Emily C. Zabor, DrPH — <https://www.emilyzabor.com/>
+:::
+
+## Today's Roadmap
+
+::: ko
+1부: 생존분석 기초 (카플란-마이어 곡선, 로그순위 검정, Cox 모형) · 2부: 랜드마크 분석과 시간의존 공변량
+:::
+
+**Part 1 — Introduction to Survival Analysis**
+
+- Censoring, survival time, and the survival function
+- Kaplan-Meier curves, median survival, log-rank tests
+- The Cox proportional hazards model
+
+**Part 2 — Landmark Analysis & Time-Dependent Covariates**
+
+- Why baseline-only covariates can mislead in EHR studies
+- The landmark approach
+- Time-dependent covariates with counting-process data
+
+::: aside
+Source material: Emily C. Zabor, *Survival analysis in R*, [emilyzabor.com](https://www.emilyzabor.com/survival-analysis-in-r.html)
+:::
+
+# Part 1: Introduction to Survival Analysis
+
+::: ko
+1부: 생존분석 입문
+:::
+
+## What Makes Survival Data Different?
+
+::: ko
+생존 데이터에는 명확한 시작 시점과 종료 시점이 있습니다.
+:::
+
+Survival data have a defined **start time** and **end time**.
+
+:::: {.columns}
+::: {.column width="50%"}
+**Classic examples**
+
+- Time from surgery to death
+- Time from treatment start to progression
+- Time from response to recurrence
+:::
+
+::: {.column width="50%"}
+**EHR / broader examples**
+
+- Time from HIV diagnosis to AIDS onset
+- Time from a charted heart attack to a guideline-recommended prescription
+- Time to first substance-use encounter
+- Time to device or equipment malfunction
+:::
+::::
+
+::: {.fragment .fade-in}
+Because this structure appears in many fields, it goes by other names too: **reliability analysis, duration analysis, event history analysis, time-to-event analysis**.
+:::
+
+## Censoring
+
+::: ko
+중도절단: 사건이 일어나기 전에 관찰이 끝난 경우입니다. 여기서는 우측 중도절단을 다룹니다.
+:::
+
+A subject is **censored** when we stop observing them before their event occurs:
+
+- Loss to follow-up (patient moves or changes health systems)
+- Withdrawal from a study
+- No event by the end of the observation / extract window
+
+We focus on **right censoring** — the most common type in EHR follow-up.
+
+![](https://www.emilyzabor.com/images/trial_anatomy.png){fig-align="center" height="260"}
+
+## Why We Can't Just Drop Censored Patients
+
+::: ko
+중도절단된 환자를 제외하면 그들이 실제로 제공한 추적 정보를 버리게 됩니다.
+:::
+
+Suppose we follow 10 subjects and ask: *what proportion are event-free at 10 years?*
+
+:::: {.columns}
+::: {.column width="58%"}
+```{r}
+#| label: swimmer-plot
+#| fig-width: 6
+#| fig-height: 3.7
+swim_dat <- tibble(
+  id     = factor(1:10),
+  time   = c(8, 5, 9, 7, 6, 10, 10, 8.5, 4, 6.5),
+  status = c(0, 1, 0, 0, 0, 0, 0, 0, 1, 1)
+) |>
+  mutate(event_label = factor(if_else(status == 1, "Event", "Censored"),
+                              levels = c("Event", "Censored")))
+
+ggplot(swim_dat, aes(x = time, y = id)) +
+  geom_col(fill = "grey80", width = 0.4, orientation = "y") +
+  geom_point(aes(shape = event_label, color = event_label, fill = event_label),
+             size = 3.5, stroke = 1) +
+  geom_vline(xintercept = 10, linetype = "dashed") +
+  scale_shape_manual(values = c(Event = 24, Censored = 21)) +
+  scale_color_manual(values = c(Event = "firebrick", Censored = "steelblue")) +
+  scale_fill_manual(values = c(Event = "firebrick", Censored = "steelblue")) +
+  scale_x_continuous(breaks = 0:10, limits = c(0, 10.5)) +
+  labs(x = "Years", y = "Subject", shape = NULL, color = NULL, fill = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom")
+```
+:::
+
+::: {.column width="42%"}
+- **6, 7**: event-free at 10 years
+- **2, 9, 10**: event before 10 years
+- **1, 3, 4, 5, 8**: censored before 10 years — status at 10 years unknown, but each contributed real event-free follow-up
+
+::: {.callout-note}
+Dropping censored patients throws away real information. Survival methods use the partial follow-up they *did* contribute.
+:::
+:::
+::::
+
+## Notation: What We Actually Observe
+
+::: ko
+관찰 시간은 실제 사건 시간과 중도절단 시간 중 더 빠른 쪽이며, 사건 지표(δ)와 함께 기록합니다.
+:::
+
+If censoring occurs first, we never see subject $i$'s true event time $T_i$. We observe:
+
+$$Y_i = \min(T_i, C_i)$$
+
+- $T_i$ = true event time
+- $C_i$ = censoring time
+- $Y_i$ = the **observed** time (whichever comes first)
+
+$$\delta_i = \begin{cases} 1 & \text{if } T_i \le C_i \text{ (event observed)} \\ 0 & \text{if } T_i > C_i \text{ (censored)} \end{cases}$$
+
+Every survival dataset needs, at minimum, two columns per subject: **observed time** and **event indicator**.
+
+## The Survival Function
+
+::: ko
+생존함수 S(t)는 시점 t 이후까지 사건 없이 지낼 확률이며, 카플란-마이어 방법으로 추정합니다.
+:::
+
+$$S(t) = Pr(T > t) = 1 - F(t)$$
+
+- $S(t)$: probability of remaining event-free beyond time $t$
+- $F(t) = Pr(T \le t)$: cumulative distribution function of event times
+
+Properties:
+
+- $S(0) = 1$ — everyone starts event-free
+- $S(t)$ never increases as $t$ grows
+- In theory $S(t)$ is smooth; in practice we observe events at **discrete** times, so estimates are step functions
+
+::: {.fragment}
+**Kaplan-Meier estimator**: at each event time, multiply the running survival estimate by the proportion of at-risk patients who did *not* have the event. Censored patients count in the risk set until they leave it.
+:::
+
+## Setup: Packages
+
+::: ko
+이 강의에서 사용할 R 패키지입니다.
+:::
+
+```{r}
+#| label: setup-part1
+library(tidyverse)  # dplyr, ggplot2, tibble, etc.
+library(survival)   # Surv(), survfit(), coxph(), tmerge()
+library(lubridate)  # date handling
+library(ggsurvfit)  # Kaplan-Meier plots
+library(gtsummary)  # publication-ready tables
+```
+
+| Package | Used for |
+|---|---|
+| **survival** | Core functions: `Surv()`, `survfit()`, `survdiff()`, `coxph()`, `tmerge()` |
+| **ggsurvfit** | Kaplan-Meier plots with risk tables |
+| **gtsummary** | Formatted survival and regression tables |
+| **lubridate** | Turning EHR dates into elapsed time |
+| **SemiCompRisks** | `BMT` example dataset (Part 2) |
+
+## The `lung` Dataset
+
+::: ko
+원자료의 status는 1=중도절단, 2=사망으로 되어 있으므로, 표준 형식인 0=중도절단, 1=사망으로 재코딩합니다.
+:::
+
+Advanced lung cancer patients (NCCTG; built into **survival**) — a stand-in for a small EHR extract. Variables: `time` (days), `status`, `sex` (1 = male, 2 = female).
+
+:::: {.columns}
+::: {.column width="50%"}
+**As shipped:** `status` is **1 = censored, 2 = dead** (non-standard!)
+
+```{r}
+#| label: raw-status
+head(survival::lung[, c("time", "status", "sex")])
+```
+:::
+
+::: {.column width="50%"}
+**Recoded** to the usual **0 = censored, 1 = dead**:
+
+```{r}
+#| label: recode-status
+lung <- survival::lung |>
+  mutate(status = recode(status, `1` = 0, `2` = 1))
+
+head(lung[, c("time", "status", "sex")])
+```
+:::
+::::
+
+Rows 3 and 6 (censored): `1` → `0`; deaths: `2` → `1`. `Surv()` accepts 1/0 or 2/1 coding, but **you** must know which your data use — mis-coded status flags are a common EHR trap.
+
+<!-- Slide hidden from the presentation; the date-handling code is kept here for reference and still runs. -->
+## From EHR Dates to Survival Time {visibility="hidden"}
+
+```{r}
+#| label: date-example
+# Raw EHR dates usually arrive as character strings
+date_ex <- tibble(
+  sx_date       = c("2007-06-22", "2004-02-13", "2010-10-27"),
+  last_fup_date = c("2017-04-15", "2018-07-04", "2016-10-31")
+)
+
+# ymd() parses year-month-day text into dates; %--% creates an interval;
+# as.duration() converts it to seconds; dividing by dyears(1) gives years
+date_ex <- date_ex |>
+  mutate(
+    sx_date       = ymd(sx_date),
+    last_fup_date = ymd(last_fup_date),
+    os_yrs = as.duration(sx_date %--% last_fup_date) / dyears(1)
+  )
+date_ex
+```
+
+## Creating a Survival Object
+
+::: ko
+Surv() 객체는 관찰 시간과 사건 여부를 하나로 묶으며, 숫자 뒤의 '+'는 중도절단을 뜻합니다.
+:::
+
+```{r}
+#| label: surv-object
+lung_surv <- Surv(lung$time, lung$status)
+lung_surv[1:10]
+```
+
+`Surv()` stores time + status as a two-column matrix (`+` = censored), so both can be pulled back out — including a censored subject with **< 1000** days:
+
+```{r}
+#| label: surv-object-columns
+ids <- c(1, 3, 38)
+
+tibble(
+  subject = ids,
+  time    = lung_surv[ids, "time"],
+  status  = lung_surv[ids, "status"],
+  Surv    = format(lung_surv[ids])
+)
+```
+
+Subject 1 (`status = 1`) **died** at day 306; subjects 3 and 38 (`status = 0`) were **censored** — alive at last contact on days 1010 and 965.
+
+## Fitting the Kaplan-Meier Curve
+
+::: ko
+survfit()으로 전체 코호트의 카플란-마이어 생존곡선을 추정합니다.
+:::
+
+```{r}
+#| label: survfit-object
+s1 <- survfit(Surv(time, status) ~ 1, data = lung)
+s1
+```
+
+- `~ 1` fits a single curve for the whole cohort (no groups)
+- 228 patients, 165 deaths
+- The `survfit` object stores each step `time` and the estimated $S(t)$ at that step (`surv`)
+
+## Kaplan-Meier Plot with `{ggsurvfit}`
+
+::: ko
+survfit2()와 ggsurvfit()으로 위험표(number at risk)가 포함된 카플란-마이어 곡선을 그립니다.
+:::
+
+`survfit2()` works like `survfit()` but stores the calling environment, giving `ggsurvfit()` better default labels and p-values.
+
+```{r}
+#| label: km-plot
+#| fig-height: 4.0
+survfit2(Surv(time, status) ~ 1, data = lung) |>
+  ggsurvfit(linewidth = 1) +
+  add_confidence_interval() +
+  add_risktable() +
+  labs(x = "Days", y = "Overall survival probability")
+```
+
+## Estimating *x*-Year Survival
+
+::: ko
+1년 생존율은 41%입니다 (95% 신뢰구간 34–49%).
+:::
+
+What is the probability of surviving beyond **1 year** (365.25 days)?
+
+```{r}
+#| label: xyear-survival
+summary(s1, times = 365.25)
+```
+
+:::: {.columns}
+::: {.column width="50%"}
+```{r}
+#| label: xyear-table
+s1 |>
+  tbl_survfit(
+    times = 365.25,
+    label_header = "**1-year survival (95% CI)**"
+  )
+```
+:::
+
+::: {.column width="50%"}
+1-year survival is **41%** (95% CI 34%–49%).
+
+65 patients were still at risk at 1 year.
+:::
+::::
+
+## The Naive Trap: Ignoring Censoring
+
+::: ko
+중도절단을 무시하면 1년 생존율을 과대추정하게 됩니다 (47% vs. 41%).
+:::
+
+**Wrong approach**: 121 of 228 patients died within 1 year, so 1-year survival = 1 − 121/228 = **47%**.
+
+```{r}
+#| label: naive-xyear
+lung |>
+  summarise(
+    n_total             = n(),
+    died_within_1yr     = sum(status == 1 & time <= 365.25),
+    censored_before_1yr = sum(status == 0 & time < 365.25),
+    naive_survival      = 1 - died_within_1yr / n_total
+  )
+```
+
+- The naive estimate treats the **42 patients censored before 1 year** as if they were known to be alive at 1 year
+- Some of them likely died after leaving observation, so the naive estimate **overestimates** survival (47% vs. 41%)
+
+## Median Survival Time
+
+::: ko
+중앙 생존시간은 310일이며, 사망자만으로 계산하면 226일로 과소추정됩니다.
+:::
+
+Median survival = the first time at which $S(t)$ drops to **0.5 or below**.
+
+:::: {.columns}
+::: {.column width="55%"}
+```{r}
+#| label: median-survival
+s1
+```
+:::
+
+::: {.column width="45%"}
+```{r}
+#| label: median-table
+s1 |>
+  tbl_survfit(
+    probs = 0.5,
+    label_header = "**Median survival (95% CI)**"
+  )
+```
+:::
+::::
+
+Median survival is **310 days** (95% CI 285–363).
+
+::: {.fragment}
+**Naive trap #2**: the median time among only the 165 patients who died is **226 days** — an **underestimate**, because it discards censored patients, who by definition survived at least as long as their follow-up.
+:::
+
+## Comparing Groups: The Log-Rank Test
+
+::: ko
+로그순위 검정은 두 군 이상의 생존곡선을 비교합니다. 이 자료에서는 성별에 따라 생존이 유의하게 다릅니다.
+:::
+
+```{r}
+#| label: logrank
+survdiff(Surv(time, status) ~ sex, data = lung)
+```
+
+- **Weights all time points equally**: at each death time it compares observed vs. expected deaths per group, and adds these up with the same weight — a late difference (few patients left) counts as much per death as an early one
+- **Observed vs. Expected**: men (`sex=1`) had more deaths than expected (112 vs. 91.6), women fewer (53 vs. 73.4); $\chi^2 = 10.3$, $p = 0.001$
+
+## The Cox Proportional Hazards Model
+
+::: ko
+Cox 비례위험모형은 기저 해저드의 형태를 가정하지 않는 준모수적 모형이며, 각 exp(β)는 위험비(HR)입니다.
+:::
+
+$$h(t\,|\,X_i) = h_0(t)\exp(\beta_1 X_{i1} + \cdots + \beta_p X_{ip})$$
+
+- $X_{ij}$: covariate $j$ for patient $i$ (e.g., $X_{i1}$ = sex, $X_{i2}$ = age); $\beta_j$ = its coefficient
+- $h(t\,|\,X_i)$: **hazard** — instantaneous event rate at time $t$ among those still at risk
+- $h_0(t)$: **baseline hazard** (all covariates = 0), left unspecified → **semi-parametric** model
+- Each $\exp(\beta_j)$ is a **hazard ratio (HR)**
+
+Key assumptions:
+
+- **Non-informative censoring**: being censored is unrelated to prognosis
+- **Proportional hazards**: the HR between groups is constant over time
+
+## Fitting the Cox Model
+
+::: ko
+여성의 남성 대비 위험비(HR)는 0.59입니다.
+:::
+
+```{r}
+#| label: coxph-fit
+coxph(Surv(time, status) ~ sex, data = lung)
+```
+
+- `coef` = $\beta$ = −0.531 (log hazard ratio)
+- `exp(coef)` = HR = **0.588** for `sex` (female vs. male, since `sex` is coded 1/2)
+
+## Interpreting the Hazard Ratio
+
+::: ko
+HR = 0.59: 어느 시점에서든 아직 생존해 있는 여성의 순간 사망률(해저드)이 남성보다 41% 낮다는 뜻입니다.
+:::
+
+```{r}
+#| label: coxph-table
+coxph(Surv(time, status) ~ sex, data = lung) |>
+  tbl_regression(exp = TRUE)
+```
+
+- HR < 1 → **reduced** hazard; HR > 1 → **increased** hazard
+- HR = 0.59 means that, at any point in follow-up, women still at risk have a **41% lower hazard** (instantaneous rate) of death than men still at risk
+
+## Hazard of Death vs. Risk of Death
+
+::: ko
+해저드는 '지금 이 순간'의 사망 속도이고, 위험(risk)은 시점 t까지 누적된 사망 확률입니다. 따라서 HR은 위험비(RR)와 다릅니다.
+:::
+
+:::: {.columns}
+::: {.column width="50%"}
+**Hazard** — a *rate* at one moment: among patients **still alive at day $t$**, how fast deaths are occurring right then (≈ deaths per person-day). Like a car's **speedometer**.
+
+**Risk** — a *probability*, accumulated: chance of having died **by** day $t$, $1 - S(t)$. Like the **distance traveled** so far — built up from all the hazards along the way.
+:::
+
+::: {.column width="50%"}
+Same data, 1-year risk of death by sex:
+
+```{r}
+#| label: risk-vs-hazard
+km_sex <- summary(survfit(Surv(time, status) ~ sex, data = lung),
+                  times = 365.25)
+tibble(
+  sex          = c("Male", "Female"),
+  surv_1yr     = round(km_sex$surv, 2),
+  risk_1yr     = round(1 - km_sex$surv, 2)
+) |>
+  mutate(risk_ratio = round(risk_1yr / first(risk_1yr), 2))
+```
+
+- 1-year risk ratio (women vs. men) = **0.71** — a 29% lower *risk*, not 41%
+:::
+::::
+
+::: {.callout-important}
+An HR compares **rates**, not **risks**. HR = 0.59 does not mean a 41% lower probability of dying by a given time; the risk ratio depends on the time point.
+:::
+
+## Part 1 Recap
+
+::: ko
+중도절단을 올바르게 다루는 방법(카플란-마이어, 로그순위 검정, Cox 모형)을 사용해야 편향 없는 추정이 가능합니다.
+:::
+
+- Survival data = **observed time + event indicator**, with **censoring** as the defining complication
+- The Kaplan-Meier estimator accounts for censored follow-up when estimating $S(t)$
+- Ignoring censoring **overestimates** *x*-year survival (47% vs. 41%) and **underestimates** median survival (226 vs. 310 days)
+- The log-rank test compares survival curves between groups
+- Cox regression estimates **hazard ratios**, assuming proportional hazards — an HR is a ratio of rates, not of risks
+
+# Part 2: Landmark Analysis & Time-Dependent Covariates
+
+::: ko
+2부: 랜드마크 분석과 시간의존 공변량
+:::
+
+## The Problem with Post-Baseline Covariates
+
+::: ko
+추적 시작 이후에 측정되는 공변량을 기저 공변량처럼 다루면 불멸시간 편향(immortal time bias)이 생깁니다.
+:::
+
+Part 1 methods assume covariates are measured at **baseline** — before follow-up begins.
+
+**EHR-relevant question**: what if the covariate of interest is only known **after** follow-up starts?
+
+::: {.fragment}
+**Example**: survival is measured from the start of treatment, and we ask whether *complete response to treatment* predicts survival. But response is only known weeks or months after baseline.
+:::
+
+::: {.fragment}
+Comparing "responders" vs. "non-responders" with a standard log-rank test or Cox model is **biased in favor of responders**: a patient must survive long enough *to become* a responder. This is called **immortal time bias**.
+:::
+
+::: aside
+Anderson, Cain & Gelber. *Analysis of survival by tumor response.* J Clin Oncol. 1983;1(11):710-719.
+:::
+
+## Other Post-Baseline Covariates in Practice
+
+::: ko
+기저 시점 이후에 측정되는 공변량의 예시입니다. 해결책은 랜드마크 분석과 시간의존 공변량 두 가지입니다.
+:::
+
+Common in EHR and oncology research — all measured **after** the clock starts:
+
+:::: {.columns}
+::: {.column width="50%"}
+- Transplant failure
+- Graft-versus-host disease
+- Second resection
+:::
+
+::: {.column width="50%"}
+- Receipt of adjuvant therapy
+- Treatment adherence
+- Adverse events
+:::
+::::
+
+Two established solutions:
+
+1. **Landmark analysis**
+2. **Time-dependent covariates**
+
+## The `BMT` Dataset
+
+::: ko
+BMT 데이터: 이식 후에 발생하는 급성 이식편대숙주병(aGVHD)이 생존과 관련이 있는지 분석합니다.
+:::
+
+137 bone marrow transplant patients (`{SemiCompRisks}` package). Clock starts at transplant.
+
+:::: {.columns}
+::: {.column width="45%"}
+- `T1`: days to death or last follow-up
+- `delta1`: death indicator (1 = dead, 0 = alive)
+- `TA`: days to acute graft-versus-host disease (aGVHD); equals `T1` if aGVHD never occurred
+- `deltaA`: aGVHD indicator (1 = developed, 0 = did not)
+:::
+
+::: {.column width="55%"}
+```{r}
+#| label: bmt-setup
+# install.packages("SemiCompRisks")
+data(BMT, package = "SemiCompRisks")
+head(BMT[, c("T1", "delta1", "TA", "deltaA")])
+```
+:::
+::::
+
+**Research question**: is aGVHD — which develops *after* transplant — associated with survival?
+
+## Landmark Approach: Three Steps
+
+::: ko
+랜드마크 분석: 시점 선정 → 그 시점까지 추적 중인 환자만 포함 → 그 시점에서 공변량을 분류하고 시간을 다시 시작합니다.
+:::
+
+1. **Choose a fixed landmark time** — based on clinical knowledge, decided *before* looking at the data
+2. **Keep only patients still under follow-up at the landmark** — report how many were excluded and why (event vs. censoring before the landmark)
+3. **Classify each patient's covariate as of the landmark**, re-start the clock at the landmark, and apply standard log-rank / Cox methods
+
+::: {.callout-tip}
+Acute GVHD typically develops within the first 90 days after transplant → use a **90-day landmark**. (In this dataset, every aGVHD case occurred by day 88.)
+:::
+
+## Landmark Approach: Subset
+
+::: ko
+90일 랜드마크 코호트는 122명이며, 이 중 21명이 90일 이내에 aGVHD가 발생했습니다.
+:::
+
+:::: {.columns}
+::: {.column width="50%"}
+**Who is excluded?**
+
+```{r}
+#| label: landmark-subset
+lm_dat <- BMT |> filter(T1 >= 90)
+
+BMT |>
+  mutate(before_landmark = T1 < 90) |>
+  count(before_landmark, died = delta1 == 1)
+```
+
+- **15 patients excluded**: all died before day 90 (none were censored before the landmark) — always report this
+:::
+
+::: {.column width="50%"}
+**Who had aGVHD by day 90?**
+
+```{r}
+#| label: landmark-agvhd
+lm_dat |>
+  summarise(
+    n_landmark       = n(),
+    agvhd_by_day90   = sum(deltaA == 1 & TA <= 90),
+    latest_agvhd_day = max(TA[deltaA == 1])
+  )
+```
+
+- **122 patients** remain; **21** have `deltaA == 1` with onset `TA ≤ 90`
+- Latest onset is day 88, so here `deltaA` alone gives the same 21 — but in general also check `TA ≤ landmark`, or aGVHD *after* the landmark gets misclassified
+:::
+::::
+
+## Landmark Approach: Re-baseline and Plot
+
+::: ko
+랜드마크 시점(90일)부터 시간을 다시 계산하여 aGVHD 여부에 따른 생존곡선을 그립니다.
+:::
+
+```{r}
+#| label: landmark-refit
+#| fig-height: 4.3
+lm_dat <- lm_dat |>
+  mutate(
+    lm_T1 = T1 - 90,
+    aGVHD = factor(as.integer(deltaA == 1 & TA <= 90), levels = 0:1,
+                   labels = c("No aGVHD", "aGVHD by day 90"))
+  )
+
+survfit2(Surv(lm_T1, delta1) ~ aGVHD, data = lm_dat) |>
+  ggsurvfit(linewidth = 1) +
+  add_risktable() +
+  add_pvalue(location = "annotation", x = 1500) +
+  scale_ggsurvfit() +
+  labs(x = "Days from 90-day landmark", y = "Overall survival probability")
+```
+
+## Landmark Cox Model
+
+::: ko
+랜드마크 Cox 모형에서 aGVHD와 생존 사이에 유의한 연관성은 없었습니다 (HR 1.08).
+:::
+
+The `subset` argument of `coxph()` applies the landmark restriction directly:
+
+```{r}
+#| label: landmark-cox
+coxph(
+  Surv(T1, delta1) ~ deltaA,
+  subset = T1 >= 90,
+  data = BMT
+) |>
+  tbl_regression(exp = TRUE)
+```
+
+- HR = **1.08** (95% CI 0.57–2.07), $p = 0.8$
+- No significant association between aGVHD and survival in this landmark analysis
+
+::: aside
+Using `T1` instead of `T1 − 90` gives the same HR: shifting every time by a constant does not change the Cox partial likelihood.
+:::
+
+## Time-Dependent Covariate Approach
+
+::: ko
+공변량이 시간에 따라 변하거나, 적절한 랜드마크 시점이 없거나, 제외되는 환자가 너무 많을 때 시간의존 공변량을 사용합니다.
+:::
+
+An alternative to landmarking — often preferable when:
+
+- The covariate's value **changes over time** (not just a one-time switch)
+- There is **no obvious** single landmark time
+- Landmarking would **exclude too many** patients
+
+Requires restructuring the data into **counting-process format**: several time intervals per patient, each carrying the covariate value that applied *during* that interval.
+
+::: aside
+Therneau, Crowson & Atkinson. *Using Time Dependent Covariates and Time Dependent Coefficients in the Cox Model* (survival package vignette).
+:::
+
+## Building the Counting-Process Dataset
+
+::: ko
+tmerge()로 환자별 시간 구간 데이터(계수과정 형식)를 만듭니다.
+:::
+
+```{r}
+#| label: tmerge-setup
+BMT <- rowid_to_column(BMT, "my_id")
+
+td_dat <- tmerge(
+  data1 = BMT |> select(my_id, T1, delta1),
+  data2 = BMT |> select(my_id, T1, delta1, TA, deltaA),
+  id    = my_id,
+  death = event(T1, delta1),
+  agvhd = tdc(TA)
+)
+```
+
+- `tmerge()`: builds the long dataset of per-patient time intervals (`tstart`, `tstop`)
+- `event(T1, delta1)`: places the death indicator at the end of the correct interval
+- `tdc(TA)`: creates the **t**ime-**d**ependent **c**ovariate — 0 before day `TA`, 1 from day `TA` onward
+
+```{r}
+#| label: tmerge-rows
+#| echo: false
+cat("Rows before:", nrow(BMT), "  Rows after:", nrow(td_dat),
+    " (one extra row for each of the", sum(BMT$deltaA), "patients with aGVHD)\n")
+```
+
+## Before and After: Two Patients
+
+::: ko
+aGVHD가 발생한 환자는 발생 전과 후, 두 개의 구간(행)으로 나뉩니다.
+:::
+
+**Original format — one row per patient:**
+
+```{r}
+#| label: before-format
+BMT |>
+  filter(my_id %in% c(1, 4)) |>
+  select(my_id, T1, delta1, TA, deltaA)
+```
+
+**Counting-process format — one row per interval:**
+
+```{r}
+#| label: after-format
+td_dat |> filter(my_id %in% c(1, 4))
+```
+
+Patients 1 and 4 each split into **two rows**: one interval *before* aGVHD onset (`agvhd = 0`) and one *after* (`agvhd = 1`).
+
+## Fitting the Time-Dependent Cox Model
+
+::: ko
+시간의존 Cox 모형에서도 aGVHD는 사망과 유의한 연관이 없었습니다 (HR 1.40).
+:::
+
+```{r}
+#| label: tdc-cox
+coxph(
+  Surv(time = tstart, time2 = tstop, event = death) ~ agvhd,
+  data = td_dat
+) |>
+  tbl_regression(exp = TRUE)
+```
+
+- HR = **1.40** (95% CI 0.81–2.43), $p = 0.2$
+- Same conclusion as the landmark analysis: aGVHD is **not** significantly associated with death
+- The point estimates differ (1.40 vs. 1.08) because the methods use different data: the time-dependent model keeps all 137 patients and all follow-up from day 0
+
+## Landmark vs. Time-Dependent Covariate
+
+::: ko
+랜드마크 분석은 시각화에 유리하고, 시간의존 공변량은 모든 데이터를 활용하는 주 분석에 유리합니다.
+:::
+
+::: {.small-table}
+| | Landmark analysis | Time-dependent covariate |
+|---|---|---|
+| **Strength** | Simple; easy to **visualize** with KM curves | Uses all data; easily handles **multiple** covariates |
+| **Requires** | A clinically justified, pre-specified landmark time | Counting-process data setup (`tmerge()`) |
+| **Data loss** | Drops patients with an event/censoring before the landmark | Uses all available follow-up |
+| **Covariate** | Status fixed at the landmark; later changes ignored | Status can **change** at any time during follow-up |
+:::
+
+Many analyses use **both**: landmark plots for a clear visual, and a time-dependent Cox model for the primary inference.
+
+## Part 2 Recap
+
+::: ko
+기저 시점 이후 공변량은 랜드마크 분석이나 시간의존 공변량으로 다루어야 불멸시간 편향을 피할 수 있습니다.
+:::
+
+- Covariates measured **after** baseline (very common in EHR data) cause **immortal time bias** if treated as baseline covariates
+- **Landmark analysis**: pick a fixed time, exclude patients with events or censoring before it, re-baseline, then analyze — simple and great for visualization
+- **Time-dependent covariates**: restructure into counting-process format with `tmerge()`, `event()`, `tdc()` — uses all follow-up and supports multivariable models
+- In the `BMT` data, both approaches agreed: aGVHD was not significantly associated with survival (HR 1.08 landmark; HR 1.40 time-dependent)
+
+## References
+
+::: ko
+참고문헌
+:::
+
+- Zabor, E.C. *Survival analysis in R.* <https://www.emilyzabor.com/survival-analysis-in-r.html>
+- Clark, T.G., Bradburn, M.J., Love, S.B., Altman, D.G. Survival analysis parts I–IV. *Br J Cancer.* 2003;89.
+- Rich, J.T. et al. A practical guide to understanding Kaplan-Meier curves. *Otolaryngol Head Neck Surg.* 2010;143(3):331-336.
+- Anderson, J.R., Cain, K.C., Gelber, R.D. Analysis of survival by tumor response. *J Clin Oncol.* 1983;1(11):710-719.
+- Therneau, T., Crowson, C., Atkinson, E. *Using Time Dependent Covariates and Time Dependent Coefficients in the Cox Model.* Vignette, survival package.
+
+## Thank You {.center}
+
+::: ko
+감사합니다! 질문 있으신가요?
+:::
+
+Questions?

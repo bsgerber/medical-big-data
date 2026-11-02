@@ -1,0 +1,823 @@
+---
+title: "약 복용, 데이터로 보기"
+subtitle: "Medication adherence & persistence from fill data with **AdhereR**"
+author: "Ben Gerber"
+date: today
+format:
+  revealjs:
+    theme: dracula
+    highlight-style: dracula
+    smaller: true
+    slide-number: c/t
+    transition: fade
+    hash: true
+    width: 1280
+    height: 720
+    code-fold: true
+    code-summary: "코드 보기 (show code)"
+    code-copy: true
+    footer: "AdhereR · 복약순응도와 지속성"
+    include-in-header:
+      text: "<style>.reveal div.sourceCode pre code, .reveal pre code { font-size: 1.3em; line-height: 1.35; }</style>"
+execute:
+  echo: true
+  warning: false
+  message: false
+fig-align: center
+fig-width: 11
+fig-height: 4.2
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(AdhereR)
+library(ggplot2)
+library(survival)
+
+# Dracula colours so R graphics match the slides.
+# Note: plots use English text only, so they render on any computer
+# (R graphics devices often lack a Korean font).
+drac <- c(bg = "#282a36", line = "#44475a", fg = "#f8f8f2", com = "#6272a4",
+          cyan = "#8be9fd", green = "#50fa7b", orange = "#ffb86c",
+          pink = "#ff79c6", purple = "#bd93f9", red = "#ff5555", yellow = "#f1fa8c")
+
+theme_set(
+  theme_minimal(base_size = 18) +
+    theme(plot.background  = element_rect(fill = drac[["bg"]], colour = NA),
+          panel.background = element_rect(fill = drac[["bg"]], colour = NA),
+          panel.grid.major = element_line(colour = drac[["line"]]),
+          panel.grid.minor = element_blank(),
+          text             = element_text(colour = drac[["fg"]]),
+          axis.text        = element_text(colour = drac[["fg"]]),
+          strip.text       = element_text(colour = drac[["yellow"]], face = "bold"),
+          legend.position  = "top")
+)
+
+# Teaching plot: one bar per fill. Green = inside the window, grey = outside.
+# Optional bottom row shows days covered with carry-over (PDC).
+plot_fills <- function(start, supply, ow, carry = FALSE, xmax = NULL,
+                       top = "As dispensed", bottom = "With carry-over") {
+  n <- length(start)
+  lab <- paste0("Fill ", seq_len(n), "\n(day ", start, ", ", supply, "d)")
+  d <- data.frame(row = lab, s = start, e = start + supply, panel = top)
+  if (carry) {
+    cs <- start
+    for (i in seq_len(n)[-1]) cs[i] <- max(start[i], cs[i - 1] + supply[i - 1])
+    d <- rbind(d, data.frame(row = "Days\ncovered", s = cs, e = cs + supply, panel = bottom))
+  }
+  d$row   <- factor(d$row, levels = rev(unique(d$row)))
+  d$panel <- factor(d$panel, levels = c(top, bottom))
+  d$y <- as.numeric(d$row)
+  # split each bar into the part inside and outside the period
+  inside  <- transform(d, s = pmax(s, ow[1]), e = pmin(e, ow[2]), where = "inside window")
+  inside  <- inside[inside$e > inside$s, ]
+  before  <- transform(d, e = pmin(e, ow[1]), where = "outside window")
+  before  <- before[before$e > before$s, ]
+  after   <- transform(d, s = pmax(s, ow[2]), where = "outside window")
+  after   <- after[after$e > after$s, ]
+  segs <- rbind(inside, before, after)
+  if (is.null(xmax)) xmax <- max(c(d$e, ow))
+  p <- ggplot(segs) +
+    annotate("rect", xmin = ow[1], xmax = ow[2], ymin = -Inf, ymax = Inf,
+             fill = drac[["purple"]], alpha = 0.15) +
+    geom_vline(xintercept = ow, colour = drac[["purple"]], linetype = 2, linewidth = 1) +
+    geom_rect(aes(xmin = s, xmax = e, ymin = y - 0.32, ymax = y + 0.32, fill = where)) +
+    scale_fill_manual(values = c("inside window" = drac[["green"]],
+                                 "outside window" = drac[["com"]]), name = NULL) +
+    scale_y_continuous(breaks = seq_along(levels(d$row)), labels = levels(d$row)) +
+    scale_x_continuous(breaks = seq(0, xmax, by = 10), limits = c(0, xmax)) +
+    labs(x = "Day", y = NULL)
+  if (carry) p <- p + facet_grid(panel ~ ., scales = "free_y", space = "free_y") +
+    theme(strip.text.y = element_text(angle = 0, hjust = 0))
+  p
+}
+
+# Small helper for the hand-calculation examples
+one_patient <- function(day, supply) {
+  data.frame(id = "A", date = format(as.Date("2024-01-01") + day, "%Y-%m-%d"),
+             days = supply, perday = 1, drug = "statin")
+}
+```
+
+# 시작하기 · Getting started
+
+## 오늘의 목표 · Goals
+
+::: incremental
+- Define **adherence** (복약순응도) and **persistence** (지속성)
+- Define **MPR** and **PDC**, the two classic fill-based measures
+- Compute them in AdhereR (one function for each) from fill data (조제 기록)
+- See how **definitions change results**
+:::
+
+## 왜 중요할까요? · Why it matters
+
+- Medicines only work if patients take them
+- In 청구자료 (claims: HIRA / NHIS) we never *see* pills being taken
+- We see only **when** a prescription was filled and **how many days** it covers (투약일수)
+
+. . .
+
+::: {.callout-note}
+## 핵심 질문 · Key question
+How do we turn fill dates + days supply into a number we can use?
+:::
+
+## Two different questions
+
+::: {.columns}
+::: {.column width="50%"}
+### 복약순응도 · Adherence
+
+*Is the patient taking the medicine **as prescribed** (dose, timing) while on treatment?*
+
+- Measured as a **proportion** of time with medicine available
+- e.g., 0.85 = medicine on hand 85% of days
+:::
+
+::: {.column width="50%"}
+### 지속성 · Persistence
+
+*How **long** does the patient stay on treatment before stopping?*
+
+- Measured as a **duration** (days) or yes/no at a time point
+- Ends at **discontinuation** (중단)
+:::
+:::
+
+. . .
+
+::: {.callout-important}
+## Key idea
+Adherence = *how well* taken as prescribed. Persistence = *how long* taken by time.
+:::
+
+## The ABC taxonomy (Vrijens et al., 2012)
+
+```{r}
+#| label: abc
+#| echo: false
+#| fig-height: 4.4
+set.seed(7)
+days <- data.frame(day = 0:239, taken = runif(240) < 0.85)
+ggplot(days) +
+  geom_point(aes(day, 1, colour = taken), shape = 15, size = 2.2) +
+  scale_colour_manual(values = c(`TRUE` = drac[["green"]], `FALSE` = drac[["red"]]),
+                      labels = c(`TRUE` = "dose taken", `FALSE` = "dose missed"), name = NULL) +
+  annotate("segment", x = 0, xend = 240, y = 1.45, yend = 1.45, colour = drac[["cyan"]],
+           linewidth = 1.2, arrow = arrow(ends = "both", length = unit(0.12, "in"))) +
+  annotate("text", x = 120, y = 1.62, label = "Persistence = time from A to C",
+           colour = drac[["cyan"]], size = 6.5) +
+  annotate("label", x = 0, y = 2.05, label = "A: Initiation\nfirst dose",
+           fill = drac[["line"]], colour = drac[["fg"]], size = 5.5) +
+  annotate("label", x = 120, y = 0.55, label = "B: Implementation\ndoses taken vs prescribed (= adherence)",
+           fill = drac[["line"]], colour = drac[["green"]], size = 5.5) +
+  annotate("label", x = 240, y = 2.05, label = "C: Discontinuation\nlast dose",
+           fill = drac[["line"]], colour = drac[["fg"]], size = 5.5) +
+  annotate("text", x = 305, y = 1, label = "no more doses", colour = drac[["com"]], size = 6) +
+  scale_y_continuous(limits = c(0.3, 2.3), breaks = NULL) +
+  scale_x_continuous(limits = c(-20, 365), breaks = seq(0, 360, 60)) +
+  labs(x = "Day since first prescription", y = NULL)
+```
+
+::: aside
+A = 시작 (initiation), B = 실행 (implementation), C = 중단 (discontinuation). Fill data show A (first fill), approximate B (supply), and C (supply stops).
+:::
+
+## 질문 · Quick check
+
+::: {.callout-note}
+## 시나리오
+Minjun refills a 30-day statin about **every 45 days**, for a whole year, and never stops.
+Is he **adherent**? Is he **persistent**?
+:::
+
+. . .
+
+::: {.callout-tip}
+## 정답 · Answer
+- **Persistent: yes.** He never stops, and his gaps are short.
+- **Adherent: no.** He has pills on about 30 of every 45 days, roughly **0.67**.
+- A patient can be persistent but poorly adherent, and the opposite can be true.
+:::
+
+## 패키지 설치 · Setup
+
+```{r}
+#| label: install
+#| eval: false
+#| code-fold: false
+install.packages(c("AdhereR", "ggplot2", "survival"))
+library(AdhereR)
+library(ggplot2)
+library(survival)
+```
+
+. . .
+
+- **AdhereR**: Dima & Dediu (2017), *PLoS ONE* 12(4): e0174426
+- Input = a table of **events**: one row per fill
+
+# MPR & PDC (Adherence)
+
+## MPR · Medication Possession Ratio
+
+::: {.callout-important}
+## 정의 · Definition
+**MPR** = (days supply within the period) ÷ (number of days in the period)
+:::
+
+::: incremental
+- Simply **adds up** the days supply of every fill
+- Supply that runs **past the end** of the period is usually **truncated** (not counted)
+- Overlapping fills (early refills) are counted twice, so MPR **can be greater than 1** ("stockpiling")
+:::
+
+## PDC · Proportion of Days Covered
+
+::: {.callout-important}
+## 정의 · Definition
+**PDC** = (number of days with medicine available) ÷ (number of days in the period)
+:::
+
+::: incremental
+- Counts each **day** once: covered or not
+- Early refills are **shifted forward** (leftover pills are used first)
+- So PDC is **never above 1**
+- Common rule: **PDC ≥ 0.80 = adherent** (Pharmacy Quality Alliance)
+:::
+
+## Example: one graph, both measures
+
+Three 30-day fills on days **0, 20, 70**. Period = days 0–90 (**90 days**).
+
+```{r}
+#| label: mpr-pdc-plot
+#| echo: false
+#| fig-height: 4.2
+plot_fills(c(0, 20, 70), c(30, 30, 30), ow = c(0, 90), carry = TRUE, xmax = 100,
+           top = "MPR", bottom = "PDC")
+```
+
+::: aside
+**MPR** uses the top rows (fills as dispensed). **PDC** uses the bottom row (each day counted once, overlaps shifted forward). Grey = after day 90, not counted.
+:::
+
+## 질문 · Calculate MPR and PDC
+
+::: {.callout-note}
+## 문제 · Problem
+Fills on days 0, 20, 70 (30 days each). Period = 90 days. Compute **MPR** and **PDC**.
+:::
+
+. . .
+
+::: {.callout-tip}
+## 정답 · Answer
+- **MPR**: fills 1 and 2 count fully; fill 3 runs to day 100, so only **20** of its 30 days fall in the period
+  → (30 + 30 + 20) / 90 = **0.89**
+- **PDC**: shifted, the fills cover days 0–59 and 70–89; days 60–69 are a gap
+  → 80 / 90 = **0.89**
+- They agree here. They differ when early refills **pile up** (example ① later: MPR > 1, PDC = 1).
+:::
+
+# 데이터 · The data
+
+## One row = one fill (조제 1건)
+
+| Column | Meaning | 한국어 |
+|---|---|---|
+| `id` | patient | 환자 ID |
+| `date` | dispensing date | 조제일자 |
+| `days` | days supply | 투약일수 |
+| `perday` | daily dose | 1일 투여량 |
+| `drug` | medication class | 약품 분류 |
+
+## Built-in data: `med.events`
+
+```{r}
+#| label: med-events
+knitr::kable(head(med.events, 6), row.names = FALSE)
+```
+
+::: aside
+100 simulated patients, 2 drugs (medA, medB). `DATE` is `"%m/%d/%Y"`, so we tell AdhereR via `date.format`.
+:::
+
+## 청구자료 · Korean claims data
+
+Claims extracts often have Korean column names and dates like `20240105`. Convert them first.
+
+```{r}
+#| label: claims
+raw <- data.frame(환자ID   = c("K01", "K01", "K01"),
+                  조제일자 = c("20240105", "20240210", "20240318"),
+                  투약일수 = c(30, 30, 30),
+                  약품분류 = "statin")
+claims <- data.frame(id     = raw$환자ID,
+                     date   = format(as.Date(raw$조제일자, "%Y%m%d"), "%Y-%m-%d"),
+                     days   = raw$투약일수,
+                     perday = 1,
+                     drug   = raw$약품분류)
+knitr::kable(claims)
+```
+
+## 우리 환자 5명 · Our scenario
+
+::: {.callout-note}
+## 시나리오
+Five patients start a **statin (스타틴)** in 2024. We follow each for **one year** from the first fill.
+:::
+
+| Patient | Story |
+|---|---|
+| Jimin | refills exactly every 30 days (모범 환자) |
+| Minjun | 30-day fills, always 10–20 days late |
+| Seoyeon | 90-day fills, refills early (stockpiling) |
+| Hajun | stops after 4 months, restarts 4 months later |
+| Sua | switches atorvastatin → rosuvastatin after 6 months |
+
+## 따라 해 보세요 · Build the data
+
+```{r}
+#| label: make-data
+make_fills <- function(id, start, intervals, days, drug, perday = 1) {
+  dates <- as.Date(start) + cumsum(c(0, intervals))   # intervals = days between fills
+  data.frame(id = id, date = format(dates, "%Y-%m-%d"),
+             days = days, perday = perday, drug = drug)
+}
+
+fills <- rbind(
+  make_fills("Jimin",   "2024-01-02", rep(30, 11),                   30, "atorvastatin"),
+  make_fills("Minjun",  "2024-01-05", c(45, 40, 50, 42, 48, 40, 45), 30, "atorvastatin"),
+  make_fills("Seoyeon", "2024-01-10", rep(70, 4),                    90, "atorvastatin"),
+  make_fills("Hajun",   "2024-01-03", c(30, 30, 30, 150, 30, 30),    30, "atorvastatin"),
+  make_fills("Sua",     "2024-01-08", rep(30, 5),                    30, "atorvastatin"),
+  make_fills("Sua",     "2024-07-08", rep(30, 5),                    30, "rosuvastatin")
+)
+knitr::kable(head(fills, 4))
+```
+
+## 조제 타임라인 · See it first
+
+```{r}
+#| label: swimmer
+#| fig-height: 4.3
+fills$start <- as.Date(fills$date)
+fills$end   <- fills$start + fills$days
+
+ggplot(fills, aes(y = factor(id, levels = rev(unique(id))))) +
+  geom_segment(aes(x = start, xend = end, yend = id, colour = drug),
+               linewidth = 7, alpha = 0.8) +
+  geom_point(aes(x = start), shape = "|", size = 9, colour = drac[["fg"]]) +
+  scale_colour_manual(values = unname(drac[c("purple", "green")])) +
+  labs(x = NULL, y = NULL, colour = NULL)
+```
+
+::: aside
+Each bar = the days covered by one fill; ticks = fill dates. Gaps and overlaps are already visible.
+:::
+
+## AdhereR's view: `CMA0`
+
+```{r}
+#| label: cma0
+#| out-width: "100%"
+#| fig-height: 4.4
+cma0 <- CMA0(data = fills,
+             ID.colname = "id", event.date.colname = "date",
+             event.duration.colname = "days", event.daily.dose.colname = "perday",
+             medication.class.colname = "drug", date.format = "%Y-%m-%d")
+plot(cma0, align.all.patients = TRUE, show.legend = FALSE)
+```
+
+::: aside
+`CMA0` computes nothing; it stores the data and draws it. Always look before you compute.
+:::
+
+# CMA: AdhereR's measures
+
+## CMA: Continuous Medication Availability
+
+AdhereR's general name for "supply ÷ time". MPR and PDC are special cases.
+
+. . .
+
+The CMAs differ on **four choices** (Vollmer et al., 2012):
+
+::: incremental
+1. **Window**: which days form the denominator?
+2. **Cap**: is the value limited to 1?
+3. **Carry-over (이월)**: are leftover pills from early refills used later?
+4. **Before the window**: do pills from fills *before* the window count?
+:::
+
+## 기간 두 가지 · Two windows
+
+```{r}
+#| label: windows
+#| echo: false
+#| fig-height: 3.2
+w <- data.frame(y = factor(c("Follow-up window (FUW)", "Observation window (OW)"),
+                           levels = c("Observation window (OW)", "Follow-up window (FUW)")),
+                s = c(0, 180), e = c(730, 545))
+ggplot(w) +
+  geom_segment(aes(x = s, xend = e, y = y, yend = y, colour = y), linewidth = 14) +
+  geom_text(aes(x = (s + e) / 2, y = y, label = c("e.g., 2 years", "e.g., 1 year")),
+            colour = drac[["bg"]], size = 6, fontface = "bold") +
+  scale_colour_manual(values = c(drac[["purple"]], drac[["cyan"]]), guide = "none") +
+  labs(x = "Day since first fill", y = NULL)
+```
+
+- **Follow-up window** (추적기간): all fills we use, including fills before the OW
+- **Observation window** (관찰기간): the period the CMA describes; it sits inside the FUW
+
+::: aside
+In AdhereR, `followup.window.start = 0` means "each patient's first fill"; `observation.window.start` is measured from the FUW start.
+:::
+
+## Our two measures · 두 가지 지표
+
+| | AdhereR | Numerator | Denominator | Can exceed 1? |
+|---|---|---|---|---|
+| **MPR** | **CMA2** | days supply of **all fills** | first fill → **end of OW** | yes |
+| **PDC** | **CMA7** | days **covered** (leftovers used first, incl. fills before the OW) | **whole OW** | no |
+
+. . .
+
+::: {.callout-warning}
+## 주의 · Note
+CMA2 adds up the **full** supply of every fill. It does **not** truncate the last fill at the end of the window, so it can differ from the textbook MPR we calculated earlier.
+:::
+
+::: aside
+AdhereR has nine CMAs (CMA1–CMA9). The others are variants of these two (capped, shorter windows, other carry-over rules); see Dima & Dediu (2017).
+:::
+
+## How to call AdhereR · 함수 사용법
+
+```{r}
+#| label: anatomy
+#| code-fold: false
+ex0 <- one_patient(day = c(0, 20, 70), supply = 30)   # the MPR/PDC example: fills on days 0, 20, 70
+
+pdc <- CMA7(data = ex0,
+            # (1) tell AdhereR which column is which
+            ID.colname = "id", event.date.colname = "date",
+            event.duration.colname = "days", event.daily.dose.colname = "perday",
+            medication.class.colname = "drug", date.format = "%Y-%m-%d",
+            # (2) set the windows, in days from the first fill
+            followup.window.start = 0,    followup.window.duration = 90,
+            observation.window.start = 0, observation.window.duration = 90)
+
+getCMA(pdc)   # (3) extract the result: one row per patient
+```
+
+::: aside
+For MPR, keep every argument and change `CMA7` to `CMA2`. PDC = `r format(round(getCMA(pdc)$CMA, 2), nsmall = 2)`, the same as our hand calculation.
+:::
+
+## A shortcut for the rest of the class
+
+Only the **function** and the **windows** change from call to call, so we wrap the rest:
+
+```{r}
+#| label: helper
+#| code-fold: false
+run_cma <- function(FUN, data, fu_dur = 365, ow_start = 0, ow_dur = fu_dur, ...) {
+  FUN(data = data, ID.colname = "id", event.date.colname = "date",
+      event.duration.colname = "days", event.daily.dose.colname = "perday",
+      medication.class.colname = "drug", date.format = "%Y-%m-%d",
+      followup.window.start = 0,          followup.window.duration = fu_dur,
+      observation.window.start = ow_start, observation.window.duration = ow_dur, ...)
+}
+c(MPR = getCMA(run_cma(CMA2, ex0, fu_dur = 90))$CMA,
+  PDC = getCMA(run_cma(CMA7, ex0, fu_dur = 90))$CMA)
+```
+
+::: aside
+MPR (CMA2) = `r format(round(getCMA(run_cma(CMA2, ex0, fu_dur = 90))$CMA, 2), nsmall = 2)`, not 0.89: AdhereR counts all 30 days of the last fill, including the 10 days after day 90.
+:::
+
+## 예제 ① · Early refills: by hand
+
+```{r}
+#| label: ex1-plot
+#| echo: false
+#| fig-height: 3.2
+plot_fills(c(0, 20, 40), c(30, 30, 30), ow = c(0, 60), carry = TRUE, xmax = 90,
+           top = "MPR", bottom = "PDC")
+```
+
+::: {.callout-note}
+## 문제 · Problem
+30-day fills on days **0, 20, 40**. Window = **60 days**. Compute MPR (CMA2) and PDC (CMA7).
+:::
+
+. . .
+
+::: {.callout-tip}
+## 정답 · Answer
+- **MPR** (CMA2) = (30 + 30 + 30) ÷ 60 = **1.50**: the full supply counts, including the grey days (a truncated textbook MPR would give 80 ÷ 60 = 1.33)
+- **PDC** (CMA7): leftovers carried forward cover every day 0–59, so 60 ÷ 60 = **1.00**
+:::
+
+## 예제 ① · Early refills: in AdhereR
+
+```{r}
+#| label: ex1-code
+#| code-fold: false
+ex1 <- one_patient(day = c(0, 20, 40), supply = 30)
+
+c(MPR = getCMA(run_cma(CMA2, ex1, fu_dur = 60))$CMA,
+  PDC = getCMA(run_cma(CMA7, ex1, fu_dur = 60))$CMA)
+```
+
+. . .
+
+::: {.callout-warning}
+## 생각해 봅시다 · Think
+MPR > 1 means **oversupply** (stockpiling), not "extra-good adherence". PDC counts each day once, so it cannot exceed 1.
+:::
+
+## 예제 ② · Before the window: by hand
+
+```{r}
+#| label: ex2-plot
+#| echo: false
+#| fig-height: 2.6
+plot_fills(c(0, 70), c(60, 30), ow = c(30, 120), xmax = 130)
+```
+
+::: {.callout-note}
+## 문제 · Problem
+A **60-day** fill on day 0 and a 30-day fill on day 70. Window = days **30–120** (90 days). Compute MPR (CMA2) and PDC (CMA7).
+:::
+
+. . .
+
+::: {.callout-tip}
+## 정답 · Answer
+**MPR** ignores the day-0 fill and starts at the first fill inside the window: 30 ÷ (day 70 → 120 = 50) = **0.60**.
+**PDC** counts the leftovers: days 30–59 and 70–99 covered = 60, so 60 ÷ 90 = **0.67**.
+:::
+
+## 예제 ② · Before the window: in AdhereR
+
+```{r}
+#| label: ex2-code
+#| code-fold: false
+ex2 <- one_patient(day = c(0, 70), supply = c(60, 30))
+
+# follow-up = days 0-200; observation window starts on day 30 and lasts 90 days
+c(MPR = getCMA(run_cma(CMA2, ex2, fu_dur = 200, ow_start = 30, ow_dur = 90))$CMA,
+  PDC = getCMA(run_cma(CMA7, ex2, fu_dur = 200, ow_start = 30, ow_dur = 90))$CMA)
+```
+
+. . .
+
+- PDC (CMA7) "sees" the pills bought **before** the window; MPR (CMA2) does not
+- This is why **CMA7** is the usual choice for a fixed study period
+
+# 시나리오: 복약순응도 · Scenario: adherence
+
+## Our 5 patients: MPR and PDC
+
+```{r}
+#| label: cma-table
+#| code-fold: false
+mpr <- getCMA(run_cma(CMA2, fills))   # default windows: first year from first fill
+pdc <- getCMA(run_cma(CMA7, fills))
+res <- data.frame(id = mpr$id, MPR = round(mpr$CMA, 2), PDC = round(pdc$CMA, 2))
+res$adherent <- res$PDC >= 0.80
+knitr::kable(res)
+```
+
+. . .
+
+- **Seoyeon**: MPR = `r res$MPR[res$id == "Seoyeon"]` (stockpiling) but PDC = `r res$PDC[res$id == "Seoyeon"]`
+- **Minjun** and **Hajun** are below 0.80. Is Hajun's problem *adherence* or *persistence*?
+
+::: aside
+A yes/no cut-off loses information (0.79 vs 0.81), so report the continuous PDC too.
+:::
+
+## Plot a CMA with AdhereR
+
+```{r}
+#| label: cma7-plot
+#| out-width: "100%"
+#| fig-height: 4.4
+plot(run_cma(CMA7, fills), align.all.patients = TRUE, show.legend = FALSE)
+```
+
+::: aside
+`plot()` works on any CMA object. Shaded area = observation window; the bar on the left shows each patient's PDC (CMA7).
+:::
+
+# 지속성 · Persistence
+
+## 치료 에피소드 · Treatment episodes
+
+- **Treatment episode**: a stretch of continuous treatment
+- **Permissible gap (허용 공백)**: the longest break between running out and refilling that still counts as "continuing"
+- **Discontinuation (중단)**: a break **longer** than the permissible gap
+
+```{r}
+#| label: gap-sketch
+#| echo: false
+#| fig-height: 2.8
+ex <- data.frame(s = c(0, 30, 75, 105, 240, 270), e = c(30, 60, 105, 135, 270, 300))
+ggplot(ex) +
+  geom_rect(aes(xmin = s, xmax = e, ymin = 0.85, ymax = 1.15), fill = drac[["green"]], colour = drac[["bg"]]) +
+  annotate("segment", x = 60, xend = 75, y = 1.3, yend = 1.3, colour = drac[["yellow"]],
+           arrow = arrow(ends = "both", length = unit(0.08, "in"))) +
+  annotate("text", x = 67, y = 1.5, label = "15 days <= 90\nsame episode", colour = drac[["yellow"]], size = 5) +
+  annotate("segment", x = 135, xend = 240, y = 1.3, yend = 1.3, colour = drac[["red"]],
+           arrow = arrow(ends = "both", length = unit(0.08, "in"))) +
+  annotate("text", x = 187, y = 1.5, label = "105 days > 90\ndiscontinued -> new episode", colour = drac[["red"]], size = 5) +
+  annotate("text", x = 67, y = 0.65, label = "Episode 1", colour = drac[["cyan"]], size = 6) +
+  annotate("text", x = 270, y = 0.65, label = "Episode 2", colour = drac[["cyan"]], size = 6) +
+  scale_y_continuous(limits = c(0.5, 1.7), breaks = NULL) +
+  labs(x = "Day", y = NULL)
+```
+
+::: aside
+Persistence = length of the episode (days), or whether the patient is still in their first episode at a time point (e.g., 1 year).
+:::
+
+## 예제 ③ · Hajun's episodes: by hand
+
+::: {.callout-note}
+## 문제 · Problem
+Hajun: 30-day fills on days 0, 30, 60, 90, then **240**, 270, 300. Permissible gap = **90 days**. How many episodes? How long is episode 1?
+:::
+
+. . .
+
+::: {.callout-tip}
+## 정답 · Answer
+- Supply runs out on **day 120**; the next fill is day 240, a gap of **120 days > 90**
+- So **2 episodes**. Episode 1 lasts **120 days** (days 0–120); episode 2 starts on day 240
+:::
+
+## 예제 ③ · Episodes in AdhereR
+
+```{r}
+#| label: episodes
+#| code-fold: false
+ep <- compute.treatment.episodes(
+  data = fills, ID.colname = "id", event.date.colname = "date",
+  event.duration.colname = "days", event.daily.dose.colname = "perday",
+  medication.class.colname = "drug", date.format = "%Y-%m-%d",
+  carry.only.for.same.medication = FALSE, consider.dosage.change = FALSE,  # same rules as CMA7
+  maximum.permissible.gap = 90,                            # permissible gap, in days
+  medication.change.means.new.treatment.episode = TRUE,    # drug switch = new episode
+  followup.window.start = 0, followup.window.duration = 365)
+```
+
+```{r}
+#| label: episodes-table
+#| echo: false
+show <- ep$id %in% c("Hajun", "Minjun", "Sua")          # selected patients
+knitr::kable(ep[show, c("id", "episode.ID", "episode.start", "episode.end",
+                        "episode.duration", "end.episode.gap.days")],
+             col.names = c("id", "episode", "start", "end", "duration (d)", "gap after (d)"),
+             row.names = FALSE)
+```
+
+::: aside
+Hajun: 2 episodes (episode 1 = 120 days, as by hand). Minjun: late but **persistent**. Sua: 2 only because a drug switch = new episode; use `FALSE` for statin-class persistence.
+:::
+
+## 허용 공백 바꾸기 · Gap sensitivity
+
+```{r}
+#| label: sensitivity
+#| fig-height: 3.6
+n_episodes <- function(gap) {
+  e <- compute.treatment.episodes(
+    data = fills, ID.colname = "id", event.date.colname = "date",
+    event.duration.colname = "days", event.daily.dose.colname = "perday",
+    medication.class.colname = "drug", date.format = "%Y-%m-%d",
+    carry.only.for.same.medication = FALSE, consider.dosage.change = FALSE,
+    medication.change.means.new.treatment.episode = FALSE,   # statin class
+    maximum.permissible.gap = gap, followup.window.duration = 365)
+  tapply(e$episode.ID, e$id, max)
+}
+gaps <- c(7, 15, 30, 60, 90, 180)
+sens <- do.call(rbind, lapply(gaps, function(g) {
+  n <- n_episodes(g); data.frame(gap = g, id = names(n), episodes = as.vector(n)) }))
+
+ggplot(sens, aes(factor(gap), factor(id, levels = rev(unique(fills$id))), fill = episodes)) +
+  geom_tile(colour = drac[["bg"]], linewidth = 2) +
+  geom_text(aes(label = episodes), size = 7, colour = drac[["bg"]], fontface = "bold") +
+  scale_fill_gradient(low = drac[["green"]], high = drac[["pink"]], guide = "none") +
+  labs(x = "Permissible gap (days)", y = NULL)
+```
+
+::: aside
+Numbers = episodes per patient. Minjun runs out 10–20 days before each refill, so a 7- or 15-day gap splits his treatment into many episodes. Justify your gap and report sensitivity analyses.
+:::
+
+## Adherence *within* episodes
+
+```{r}
+#| label: per-episode
+#| code-fold: false
+cpe <- run_cma(CMA_per_episode, fills, CMA.to.apply = "CMA7",
+               maximum.permissible.gap = 90,
+               medication.change.means.new.treatment.episode = FALSE)
+```
+
+```{r}
+#| label: per-episode-table
+#| echo: false
+res_ep <- getCMA(cpe)[, c("id", "episode.ID", "episode.start", "episode.duration", "CMA")]
+res_ep$CMA <- round(res_ep$CMA, 2)
+knitr::kable(res_ep, col.names = c("id", "episode", "start", "duration (d)", "PDC"))
+```
+
+::: aside
+Hajun: PDC = 1.00 in episode 1 (perfect while on treatment) and 0.72 in episode 2, which runs to the end of follow-up and includes 35 days with no medicine. His main problem is **lack of persistence**.
+:::
+
+## Adherence over time: sliding window
+
+```{r}
+#| label: sliding
+#| out-width: "90%"
+#| fig-height: 4
+sw <- run_cma(CMA_sliding_window, fills, CMA.to.apply = "CMA7",
+              sliding.window.duration = 90, sliding.window.step.duration = 30)
+plot(sw, align.all.patients = TRUE, show.legend = FALSE)
+```
+
+::: aside
+PDC (CMA7) in 90-day windows, moving forward 30 days at a time. Shows **when** adherence drops (Hajun falls to 0 while he is off treatment).
+:::
+
+## 생존분석 · Persistence as survival
+
+```{r}
+#| label: km
+#| fig-height: 3.6
+ep_med <- compute.treatment.episodes(
+  data = med.events, ID.colname = "PATIENT_ID", event.date.colname = "DATE",
+  event.duration.colname = "DURATION", event.daily.dose.colname = "PERDAY",
+  medication.class.colname = "CATEGORY", date.format = "%m/%d/%Y",
+  carry.only.for.same.medication = FALSE, consider.dosage.change = FALSE,
+  medication.change.means.new.treatment.episode = FALSE,
+  maximum.permissible.gap = 90, followup.window.duration = 730)
+
+first <- ep_med[ep_med$episode.ID == 1, ]
+# discontinued = gap after episode 1 is longer than the permissible gap
+first$event <- as.integer(first$end.episode.gap.days > 90)
+# time = episode length (for censored patients it already runs to the end of follow-up)
+first$time  <- pmin(first$episode.duration, 730)
+km <- survfit(Surv(time, event) ~ 1, data = first)
+
+km_df <- data.frame(time = c(0, km$time), surv = c(1, km$surv))
+ggplot(km_df, aes(time, surv)) +
+  geom_step(colour = drac[["cyan"]], linewidth = 1.3) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(x = "Days since first fill", y = "Still on treatment")
+```
+
+::: aside
+`med.events`, permissible gap 90 days. Median persistence: `r round(summary(km)$table[["median"]])` days. `r sum(first$event)` of `r nrow(first)` patients discontinued within 2 years.
+:::
+
+# 정리 · Wrap-up
+
+## Key takeaways
+
+::: incremental
+- Fill data show **availability** of medicine, not actual pill-taking
+- **Adherence** = how well: **MPR** (CMA2, adds up supply) or **PDC** (CMA7, counts covered days)
+- **Persistence** = how long: treatment episodes, defined by the **permissible gap**
+- Every AdhereR call = **data + column names + windows**, then `getCMA()`
+- Look first (`CMA0`), then compute, then run **sensitivity analyses**
+:::
+
+## Reporting checklist
+
+- Which measure (MPR or PDC), and which CMA?
+- Follow-up and observation windows: start and length
+- Carry-over rules: same drug only? dose changes?
+- Does a drug switch start a new episode?
+- Permissible gap, with justification and sensitivity analyses
+- Threshold (e.g., 0.80), plus the continuous values
+
+## References
+
+- Dima AL, Dediu D (2017). Computation of adherence to medication and visualization of medication histories in R with AdhereR. *PLoS ONE* 12(4): e0174426. [doi:10.1371/journal.pone.0174426](https://doi.org/10.1371/journal.pone.0174426)
+- Vrijens B, et al. (2012). A new taxonomy for describing and defining adherence to medications. *Br J Clin Pharmacol* 73(5): 691–705.
+- Vollmer WM, et al. (2012). Measuring medication adherence: which measure is right for me? *Value Health* 15(8): 1194–1201.
+- Bounthavong M. Estimating medication adherence (MPR and PDC) in R using AdhereR, Part 1. [RPubs](https://rpubs.com/mbounthavong/medication_adherence_r_part1)
+- AdhereR: [GitHub](https://github.com/ddediu/AdhereR) · [r-universe](https://ddediu.r-universe.dev/AdhereR)
+
+## 질문 있나요? {.center}
+
+Questions? · 감사합니다!
