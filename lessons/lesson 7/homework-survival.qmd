@@ -1,0 +1,98 @@
+---
+title: "homework-survival"
+author: "이름"
+date: last-modified
+format: html
+---
+
+## SUPPORT Study
+
+SUPPORT (Study to Understand Prognoses and Preferences for Outcomes and Risks of Treatments) is a prospective study of 9,105 hospitalized adults from 5 hospitals:
+
+Phase I: A 2-year observational cohort (n = 4,301) 
+Phase II: A 2-year controlled trial of a nurse-facilitated communication intervention (n = 4,804, randomized by physician group to intervention or control). 
+
+Patients were selected by 1 or more of 8 diagnosis categories (9 originally): acute respiratory failure (ARF)/multiorgan system failure (MOSF) with sepsis, MOSF with malignancy, COPD, CHF, cirrhosis, nontraumatic coma, metastatic colon cancer, and non-small cell lung cancer — plus severity-of-illness criteria (overall 6-month mortality of 47%).
+
+```{r}
+#| label: setup
+
+library(survival)
+library(survminer)
+library(tidyverse)
+library(gtsummary)
+library(pROC)
+
+tmp <- tempfile()
+download.file("https://hbiostat.org/data/repo/support2csv.zip", tmp)
+sup <- read.csv(unz(tmp, "support2.csv"))
+```
+
+## Exploratory Analysis
+
+Based on this data, briefly answer the following questions:
+
+*1. Briefly describe the structure of the data.*
+
+*2. Briefly describe the distributions of variables.*
+
+*3. Briefly describe any missingness. Are there any missingness patterns that are important?*
+
+*4. How many are censored by 180 days? By 365 days?*
+
+
+```{r}
+#| label: describe
+
+# Add code here...
+```
+
+## Survival Analysis
+
+First: Create the necessary columns for your survival curves, `time180` and `status180`, based on `d.time` and `death` (less than or equal to 180 days).
+
+*1. Create a `survfit` object for `dzgroup` using these new columns created*
+
+*2. Plot survival curves*
+
+*3. Briefly interpret the survival curves*
+
+```{r}
+#| label: survival-analysis
+
+# Add code here...
+```
+
+## Survival Probabilities
+
+*1. What are the estimated probabilities of survival at 30, 60, 90, and 180 days for different health conditions?*
+
+*2. Is there a difference between the survival curves (make sure to test for it)?*
+
+*3. Use `gtsummary` to create a nice table of hazard ratios for these diagnoses.*
+
+```{r}
+#| label: survival-probabilities
+
+# Add code here...
+```
+
+## Bonus/Extra (Optional): Create Prediction Model and Determine AUROC
+
+*1. Create a Cox-Proportional Hazards model with covariates to predict surviving 180 days. Justify why specific covariates were used in the model (make sure no data leakage).*
+
+*2. Are the new Cox model’s hazard ratios constant over time? How can we check this? Briefly explain why this matters for interpreting the hazard ratios.*
+
+*3. Split the data into training and testing sets. What is the AUROC for a hold-out prediction model?*
+
+```{r}
+#| label: AUROC
+
+# Add code here...
+```
+
+
+
+
+
+
