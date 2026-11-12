@@ -1,0 +1,2747 @@
+---
+title: "Propensity Score Matching with EHR Data"
+subtitle: "전자건강기록(EHR) 자료를 이용한 성향점수 매칭 — R 실습 · RHC 예제"
+author: "Ben Gerber"
+date: today
+lang: ko
+format:
+  revealjs:
+    theme: dracula
+    highlight-style: dracula
+    fontsize: 24px
+    scrollable: true
+    slide-number: c/t
+    width: 1280
+    height: 760
+    code-fold: true
+    code-summary: "✅ Solution code · 정답 코드 (try first · 먼저 직접 해보세요!)"
+    code-copy: true
+    code-overflow: wrap
+    transition: fade
+    footer: "PSM with EHR data · 성향점수 매칭 실습"
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: slide-styling
+#| include: false
+# ============================================================================
+# SLIDE STYLING ONLY — not part of the students' code · 슬라이드 모양용 코드
+# ============================================================================
+suppressPackageStartupMessages({
+  library(tidyverse); library(MatchIt); library(optmatch); library(cobalt)
+  library(gtsummary); library(gt); library(survey); library(smd); library(marginaleffects)
+  library(sandwich); library(broom); library(patchwork); library(EValue); library(scales)
+})
+theme_dracula <- function(base_size = 13) {
+  theme_minimal(base_size = base_size) +
+    theme(plot.background  = element_rect(fill = "#282a36", colour = NA),
+          panel.background = element_rect(fill = "#282a36", colour = NA),
+          panel.grid.major = element_line(colour = "#44475a"),
+          panel.grid.minor = element_blank(),
+          text = element_text(colour = "#f8f8f2"), axis.text = element_text(colour = "#f8f8f2"),
+          legend.background = element_rect(fill = "#282a36", colour = NA),
+          legend.key = element_rect(fill = "#282a36", colour = NA),
+          plot.title = element_text(colour = "#bd93f9", face = "bold"))
+}
+theme_set(theme_dracula())
+options(ggplot2.discrete.fill = c("#8be9fd", "#ff79c6"),
+        ggplot2.discrete.colour = c("#8be9fd", "#ff79c6"),
+        width = 110, digits = 3)
+knitr::opts_chunk$set(dev = "png", dpi = 150, fig.align = "center")
+
+# Recolour every ggplot for the dark slides (cobalt plots use their own white theme).
+# Plots flagged with attr "keep_theme" (diagrams) are printed untouched.
+dr_cols <- theme(
+  plot.background = element_rect(fill = "#282a36", colour = NA),
+  panel.background = element_rect(fill = "#282a36", colour = NA),
+  panel.grid.major = element_line(colour = "#44475a"), panel.grid.minor = element_blank(),
+  text = element_text(colour = "#f8f8f2"),
+  axis.text = element_text(colour = "#f8f8f2"), axis.text.x = element_text(colour = "#f8f8f2"),
+  axis.text.y = element_text(colour = "#f8f8f2"), axis.title = element_text(colour = "#f8f8f2"),
+  axis.ticks = element_line(colour = "#6272a4"),
+  legend.text = element_text(colour = "#f8f8f2"), legend.title = element_text(colour = "#f8f8f2"),
+  legend.background = element_rect(fill = "#282a36", colour = NA),
+  legend.key = element_rect(fill = "#282a36", colour = NA),
+  strip.text = element_text(colour = "#f8f8f2"),
+  strip.background = element_rect(fill = "#44475a", colour = NA),
+  plot.title = element_text(colour = "#bd93f9", face = "bold"),
+  plot.subtitle = element_text(colour = "#8be9fd"))
+registerS3method("knit_print", "ggplot", function(x, ...) {
+  if (!isTRUE(attr(x, "keep_theme"))) x <- if (inherits(x, "patchwork")) x & dr_cols else x + dr_cols
+  print(x); invisible(NULL)
+}, envir = asNamespace("knitr"))
+
+# Dark styling for gt / gtsummary tables
+style_gt_dark <- function(x) {
+  gt::tab_options(x, table.background.color = "#282a36", table.font.color = "#f8f8f2",
+                  column_labels.background.color = "#44475a", table.font.size = gt::px(13),
+                  data_row.padding = gt::px(2), table.border.top.color = "#6272a4",
+                  table.border.bottom.color = "#6272a4", column_labels.border.bottom.color = "#bd93f9",
+                  row_group.background.color = "#44475a", footnotes.font.size = gt::px(11),
+                  source_notes.font.size = gt::px(11), heading.background.color = "#44475a",
+                  table.width = gt::pct(100))
+}
+gt_knit_print <- getS3method("knit_print", "gt_tbl", envir = asNamespace("knitr"))
+registerS3method("knit_print", "gt_tbl",
+                 function(x, ...) gt_knit_print(style_gt_dark(x), ...), envir = asNamespace("knitr"))
+registerS3method("knit_print", "gtsummary",
+                 function(x, ...) gt_knit_print(style_gt_dark(gtsummary::as_gt(x)), ...), envir = asNamespace("knitr"))
+
+
+# Slide-display version of a Love plot: top-n covariates only, so labels stay readable
+love_top <- function(bal, n = 25, labels = c("Before", "After")) {
+  bal$Balance |>
+    rownames_to_column("covariate") |>
+    filter(covariate != "distance", covariate != "prop.score") |>
+    slice_max(abs(Diff.Un), n = n) |>
+    mutate(covariate = fct_reorder(covariate, abs(Diff.Un))) |>
+    pivot_longer(c(Diff.Un, Diff.Adj), names_to = "sample", values_to = "smd") |>
+    mutate(sample = factor(if_else(sample == "Diff.Un", labels[1], labels[2]), levels = labels)) |>
+    ggplot(aes(abs(smd), covariate, colour = sample, shape = sample)) +
+    geom_vline(xintercept = 0.1, linetype = 2, colour = "#ffb86c") +
+    geom_point(size = 2.5) +
+    scale_colour_manual(values = c("#ff5555", "#50fa7b")) +
+    scale_shape_manual(values = c(16, 17)) +
+    labs(x = "Absolute standardized mean difference", y = NULL, colour = NULL, shape = NULL,
+         title = paste("Covariate balance:", n, "most imbalanced terms")) +
+    theme(legend.position = "top")
+}
+
+# Causal diagram helper (no axes, no grid, no special characters)
+draw_dag <- function(nodes, edges, title) {
+  e <- merge(merge(edges, nodes, by.x = "from", by.y = "id"), nodes,
+             by.x = "to", by.y = "id", suffixes = c("", "_to"))
+  dx <- e$x_to - e$x; dy <- e$y_to - e$y
+  e$x <- e$x + 0.22 * dx; e$y <- e$y + 0.22 * dy
+  e$x_to <- e$x_to - 0.22 * dx; e$y_to <- e$y_to - 0.22 * dy
+  ggplot() +
+    geom_segment(data = subset(e, lty == "solid"), aes(x = x, y = y, xend = x_to, yend = y_to),
+                 arrow = arrow(length = unit(0.25, "cm"), type = "closed"), colour = "#f8f8f2", linewidth = 0.8) +
+    geom_segment(data = subset(e, lty == "blocked"), aes(x = x, y = y, xend = x_to, yend = y_to),
+                 linetype = 2, colour = "#ff5555", linewidth = 0.8) +
+    geom_label(data = nodes, aes(x, y, label = label), fill = "#44475a", colour = "#f8f8f2",
+               label.size = 0, size = 4.2, label.padding = unit(0.4, "lines")) +
+    annotate("text", x = 0.5, y = 1.22, label = title, colour = "#bd93f9", size = 5.5, fontface = "bold") +
+    coord_cartesian(xlim = c(-0.15, 1.15), ylim = c(-0.15, 1.3)) +
+    theme_void() + theme(plot.background = element_rect(fill = "#282a36", colour = NA))
+}
+
+# Simulated teaching data file (created once if not supplied)
+if (!file.exists("sim_severity.csv")) {
+  set.seed(2026)
+  n <- 5000
+  tibble(id = 1:n, severity = round(rnorm(n), 3)) |>
+    mutate(treated = rbinom(n, 1, plogis(-0.5 + 1.5 * severity)),
+           died    = rbinom(n, 1, plogis(-1.0 + 1.2 * severity))) |>
+    write_csv("sim_severity.csv")
+}
+```
+
+
+# Before we start · 시작하기 전에 {background-color="#44475a"}
+
+수업 방식 · 임상적 배경 · 준비
+
+## How today works · 오늘 수업 방식
+
+:::: {.columns}
+::: {.column width="55%"}
+Every step follows the same cycle:
+
+::: {.callout-tip title="🧑‍💻 1. Your turn · 직접 해보기"}
+A task, with the steps and functions to use. Write the code in your own script.
+:::
+
+::: {.callout-warning title="💡 2. Hint · 힌트"}
+Only for the trickiest steps.
+:::
+
+::: {.callout-note title="✅ 3. Check · 정답 확인"}
+Click **"✅ Solution code"** to see our code. Compare, and fix yours if needed.
+:::
+
+::: {.callout-note title="🔎 4. Interpretation · 해석"}
+The **next slide** shows the result and explains what it means.
+:::
+:::
+::: {.column width="45%"}
+**You receive only:**
+
+- `psm_rhc_starter.R` — packages and data preparation
+- `sim_severity.csv` — a small simulated data set
+
+Everything else you write yourself.
+
+::: {.callout-caution title="🇰🇷 핵심 · Key point"}
+**직접 코드 작성 → (힌트) → 정답 코드 확인 → 결과 해석** 순서로 진행합니다. 정답을 보기 전에 먼저 스스로 시도하세요!
+:::
+:::
+::::
+
+## The clinical question · 임상적 질문 (1/2)
+
+**Right heart catheterization (RHC)** — the *pulmonary artery* or *Swan-Ganz* catheter
+
+:::: {.columns}
+::: {.column width="55%"}
+**What it is · 무엇인가**
+
+- A catheter passed through a large vein and the right heart into the **pulmonary artery**
+- Measures heart pressures and **cardiac output** at the bedside
+
+**Why ICU doctors used it · 사용 이유**
+
+- In shock, respiratory failure, or heart failure, it is hard to judge: *more fluid, or drugs to support the heart and blood pressure?*
+- RHC measurements were thought to **guide these treatment decisions** better than the bedside exam
+:::
+::: {.column width="45%"}
+**Risks · 위험**
+
+- Arrhythmias, infection, bleeding, lung injury
+- Measurements can be **misread** → wrong treatment
+
+**The problem (1980s–90s) · 문제점**
+
+- Widely used, but **never tested in a randomized trial**
+- Many clinicians were sure it helped → withholding it in a trial felt **unethical**
+:::
+::::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**우심도자술(RHC)**: 폐동맥까지 카테터를 넣어 심장 압력과 심박출량을 측정하는 시술. 치료 결정에 도움이 된다고 믿었지만 **무작위 임상시험 근거는 없었습니다**.
+:::
+
+## The clinical question · 임상적 질문 (2/2)
+
+**Connors et al., *JAMA* 1996**: *In critically ill ICU patients, is RHC in the first 24 hours associated with survival?*
+
+:::: {.columns}
+::: {.column width="55%"}
+**Data · 자료**
+
+- **SUPPORT** study: 5 US teaching hospitals, 1989–1994
+- **5,735** critically ill adults
+- Detailed day-1 data, like an **EHR extract**: diagnoses, APACHE III severity score, vital signs, labs, comorbidities
+
+**Findings · 결과**
+
+- Propensity score matching (1,006 pairs): **30-day mortality odds ratio 1.24** (95% CI 1.03–1.49) for RHC
+- Later RCTs (PAC-Man 2005, ESCAPE 2005, FACTT 2006) found **no benefit** from routine RHC
+:::
+::: {.column width="45%"}
+::: {.callout-tip title="🧑‍💻 Think · 생각해보기 (2 min)"}
+1. Which patients were more likely to get RHC: the most stable or the sickest?
+2. If sicker patients get RHC *and* die more often, what will a simple comparison of death rates show?
+:::
+:::
+::::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+관찰 자료로 RHC의 효과를 추정한 연구입니다. 핵심 문제: **더 위중한 환자가 RHC를 받았다**는 점입니다. 원 연구 결과: 30일 사망 **오즈비 1.24**.
+:::
+
+## Step 0 · Your starter script · 시작 스크립트
+
+Open **`psm_rhc_starter.R`**. It installs and loads the packages and prepares the data (next slides).
+
+:::: {.columns}
+::: {.column width="45%"}
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (3 min)"}
+1. In RStudio, create a new **Project** called `psm_rhc`.
+2. Copy `psm_rhc_starter.R` and `sim_severity.csv` into the project folder.
+3. Run the `install.packages()` line once. 🙋 Raise your hand if a package fails.
+:::
+:::
+::: {.column width="55%"}
+| Package | Used for |
+|---|---|
+| **tidyverse** | data wrangling and graphs |
+| **MatchIt**, **optmatch** | matching |
+| **cobalt** | balance tables and plots |
+| **gtsummary**, **gt**, **survey**, **smd** | "Table 1" with p-values and SMD, also weighted |
+| **marginaleffects**, **sandwich** | effects with correct standard errors |
+| **broom**, **patchwork** | tidy output, combine plots |
+| **EValue** | sensitivity analysis |
+| **scales** | % formatting |
+:::
+::::
+
+```{r}
+#| label: install
+#| eval: false
+install.packages(c(
+  "tidyverse", "MatchIt", "optmatch", "cobalt", "gtsummary", "gt", "survey", "smd",
+  "marginaleffects", "sandwich", "broom", "patchwork", "EValue", "scales"
+))
+```
+
+## Step 0 · Load all packages · 패키지 불러오기
+
+All packages are loaded **once**, at the top of the starter script.
+
+```{r}
+#| label: load-packages
+library(tidyverse)        # dplyr, ggplot2, readr, ...
+library(MatchIt)          # matchit(), match.data()
+library(optmatch)         # optimal / full matching
+library(cobalt)           # bal.tab(), love.plot(), bal.plot()
+library(gtsummary)        # tbl_summary(), tbl_svysummary(), tbl_merge()
+library(gt)               # table rendering
+library(survey)           # svydesign() for weighted tables
+library(smd)              # standardized mean differences (used by add_smd())
+library(marginaleffects)  # avg_comparisons()
+library(sandwich)         # robust variance
+library(broom)            # tidy()
+library(patchwork)        # p1 + p2
+library(EValue)           # evalues.RR()
+library(scales)           # percent()
+set.seed(2026)
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+Messages such as *"Attaching package"* or *"objects are masked"* are **normal**. An error such as *"there is no package called 'xxx'"* means the package is not installed.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+모든 패키지를 **처음에 한 번** 불러옵니다. "masked" 메시지는 오류가 아닙니다.
+:::
+
+## Step 0 · Prepare the RHC data · 자료 준비
+
+Also in the starter script:
+
+```{r}
+#| label: data
+url <- "https://hbiostat.org/data/repo/rhc.csv"
+if (!file.exists("rhc.csv")) download.file(url, destfile = "rhc.csv")
+rhc <- read.csv("rhc.csv")
+
+rhc <- rhc |>
+  mutate(
+    treat  = as.integer(swang1 == "RHC"),   # treatment: 1 = RHC, 0 = no RHC
+    died30 = as.integer(dth30  == "Yes"),   # outcome: 1 = died within 30 days
+    swang1 = factor(swang1, levels = c("No RHC", "RHC")),
+    across(c(cat1, ca, sex, race, income, ninsclas, dnr1, resp, card, neuro,
+             gastr, renal, meta, hema, seps, trauma, ortho), factor)
+  )
+
+# The 50 baseline covariates used by Connors et al.
+covs <- c("age","sex","race","edu","income","ninsclas","cat1","das2d3pc","dnr1",
+          "ca","surv2md1","aps1","scoma1","wtkilo1","temp1","meanbp1","resp1",
+          "hrt1","pafi1","paco21","ph1","wblc1","hema1","sod1","pot1","crea1",
+          "bili1","alb1","resp","card","neuro","gastr","renal","meta","hema",
+          "seps","trauma","ortho","cardiohx","chfhx","dementhx","psychhx",
+          "chrpulhx","renalhx","liverhx","gibledhx","malighx","immunhx",
+          "transhx","amihx")
+```
+
+## Step 0 · A helper for Table 1 · 기초특성표 도우미 함수
+
+Also in the starter script. **gtsummary** cannot show p-values and standardized mean differences (SMD) side by side on its own, so we add one small function, `add_smd()`.
+
+```{r}
+#| label: add-smd
+#| code-fold: false
+# Adds an SMD column to a gtsummary table (tbl_summary or tbl_svysummary)
+add_smd <- function(tbl) {
+  smd_fun <- function(data, variable, by, ...) {
+    w <- NULL
+    if (inherits(data, "survey.design")) { w <- weights(data); data <- data$variables }
+    tibble::tibble(smd = smd::smd(x = data[[variable]], g = data[[by]], w = w)$estimate)
+  }
+  tbl |>
+    add_stat(fns = everything() ~ smd_fun) |>
+    modify_header(smd ~ "**SMD**") |>
+    modify_fmt_fun(smd ~ label_style_number(digits = 2))
+}
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+Use it at the end of a gtsummary pipe: `tbl_summary(...) |> add_p() |> add_smd()`. You do not need to understand its internals. If the SMD column is empty, the **smd** package is not installed.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+`add_smd()`는 기초특성표에 **표준화 평균차이(SMD)** 열을 추가하는 도우미 함수입니다. 시작 스크립트에 포함되어 있습니다.
+:::
+
+## Step 0 · Explore the data · 자료 살펴보기
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (4 min)"}
+1. How many patients and variables are in `rhc`?
+2. Look at the variable types. What type are `aps1`, `pafi1`, and `cat1`?
+3. How many patients did and did not receive RHC?
+4. What proportion of all patients died within 30 days?
+
+*Functions: `dim()`, `glimpse()`, `count()`, `mean()`*
+:::
+
+```{r}
+#| label: data-explore
+#| output: false
+dim(rhc)
+glimpse(rhc)
+count(rhc, swang1)
+mean(rhc$died30)
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+자료의 크기, 변수 유형, 치료군 수, 30일 사망 비율을 확인하세요.
+:::
+
+## Step 0 · Results · 결과
+
+```{r}
+#| label: data-explore-out
+#| echo: false
+dim(rhc)
+count(rhc, swang1)
+mean(rhc$died30)
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **`r nrow(rhc)` patients** (one row per ICU admission) and `r ncol(rhc)` variables.
+- `aps1` and `pafi1` are numeric; `cat1` (primary diagnosis) is a **factor**.
+- **`r sum(rhc$treat == 1)`** patients received RHC (`r percent(mean(rhc$treat), 0.1)`); `r sum(rhc$treat == 0)` did not.
+- **`r percent(mean(rhc$died30), 0.1)`** died within 30 days. The mean of a 0/1 variable is a **proportion**.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+환자 `r nrow(rhc)`명 중 `r percent(mean(rhc$treat), 0.1)`가 RHC를 받았고, `r percent(mean(rhc$died30), 0.1)`가 30일 이내 사망했습니다.
+:::
+
+# Part 1 · Why propensity scores? {background-color="#44475a"}
+
+왜 성향점수가 필요한가?
+
+## EHR data: a goldmine with traps
+
+**전자건강기록(EHR): 보물창고, 그러나 함정이 있다**
+
+:::: {.columns}
+::: {.column width="50%"}
+### Strengths · 장점
+- **Large** — thousands to millions of patients
+- **Real-world** patients, including those excluded from trials
+- Rich detail: labs, vitals, diagnoses, medications
+- Long follow-up at low cost
+:::
+::: {.column width="50%"}
+### Problems · 문제점
+- Collected **for care, not research**
+- Treatment is chosen by clinicians → **not random**
+- Missing data and coding errors
+- Time-related biases
+:::
+::::
+
+::: {.callout-tip title="🧑‍💻 Think–pair · 생각해보기 (2 min)"}
+Name one treatment in your hospital that *sicker* patients are more likely to receive. What would a simple comparison of outcomes show?
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+EHR에서 치료는 의사가 환자 상태를 보고 결정하므로 **무작위가 아닙니다** → 단순 비교는 편향될 수 있습니다.
+:::
+
+## RCT vs. observational EHR study
+
+**무작위 대조 시험(RCT) vs. 관찰연구**
+
+```{r}
+#| label: dags
+#| echo: false
+#| out-width: 100%
+#| fig-width: 11
+#| fig-height: 3.4
+nodes <- data.frame(id = c("C", "S", "A", "Y"), x = c(0, 0.5, 0, 1), y = c(1, 0.95, 0.1, 0.1),
+                    label = c("Coin flip", "Severity", "Treatment", "Death"))
+e_rct <- data.frame(from = c("C", "A", "S", "S"), to = c("A", "Y", "Y", "A"),
+                    lty = c("solid", "solid", "solid", "blocked"))
+e_ehr <- data.frame(from = c("S", "A", "S"), to = c("A", "Y", "Y"), lty = "solid")
+n_ehr <- subset(nodes, id != "C"); n_ehr$label[n_ehr$id == "A"] <- "Treatment\n(doctor's choice)"
+p_dag <- draw_dag(nodes, e_rct, "Randomized trial (RCT)") + draw_dag(n_ehr, e_ehr, "Observational (EHR)")
+attr(p_dag, "keep_theme") <- TRUE
+p_dag
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- Arrows mean "causes". **RCT (left):** a coin flip decides treatment, so severity cannot influence it (red dashed line = arrow removed).
+- **EHR (right):** severity causes **both** treatment and death. Severity is a **confounder**: treated patients may die more even if the treatment does nothing.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**적응증에 의한 교란**: 위중한 환자일수록 치료를 받을 확률도, 사망 위험도 높습니다. 치료 효과와 중증도 효과가 **섞입니다**.
+:::
+
+## Simulation 1 · Compare death by treatment · 사망률 비교
+
+`sim_severity.csv` contains 5,000 **simulated** ICU patients where we know the truth:
+
+- `severity` (higher = sicker), `treated` (1 = yes), `died` (1 = yes)
+- Sicker patients were more likely to be treated **and** more likely to die
+- The treatment has **no effect** on death
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (4 min)"}
+1. Read the file into an object `sim`. *(`read_csv()`)*
+2. Compute the proportion who died among treated and untreated patients. *(`group_by()`, `summarise()`)*
+:::
+
+```{r}
+#| label: sim-compare
+#| output: false
+sim <- read_csv("sim_severity.csv")
+sim_by_trt <- sim |>
+  group_by(treated) |>
+  summarise(n = n(), risk_of_death = mean(died))
+sim_by_trt
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+치료 효과가 **0**인 가상 자료입니다. 치료군과 비치료군의 사망 비율을 비교해 보세요.
+:::
+
+## Simulation 1 · Results · 결과
+
+```{r}
+#| label: sim-compare-out
+#| echo: false
+sim_by_trt
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **`r percent(sim_by_trt$risk_of_death[2], 0.1)`** of treated patients died vs **`r percent(sim_by_trt$risk_of_death[1], 0.1)`** of untreated patients — about **`r round(sim_by_trt$risk_of_death[2] / sim_by_trt$risk_of_death[1], 1)` times** as high.
+- Yet the treatment does **nothing**. The treated patients were simply **sicker**.
+- This is **confounding**: the comparison mixes the effect of treatment with the effect of severity.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+효과가 없는 치료인데도 치료군 사망률이 약 `r round(sim_by_trt$risk_of_death[2] / sim_by_trt$risk_of_death[1], 1)`배 높습니다 → **교란** 때문입니다.
+:::
+
+## Simulation 2 · Compare within severity groups · 중증도별 비교
+
+Idea: compare treated and untreated patients **who are equally sick**.
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (6 min)"}
+1. Divide `severity` into **5 equal-sized groups** (1 = mildest, 5 = sickest). *(`ntile()`)*
+2. Compute the risk of death for each severity group **and** treatment group. Save as `sim_q`.
+3. Plot risk of death (y) against severity group (x), with **one line per treatment group**. Save as `p_sim`. *(`ggplot()`, `geom_line()`, `geom_point()`)*
+:::
+
+::: {.callout-warning title="💡 Hint · 힌트"}
+Treat `treated` as a factor so that ggplot draws two separate lines with different colours.
+:::
+
+```{r}
+#| label: sim-strata
+#| output: false
+sim_q <- sim |>
+  mutate(severity_q = ntile(severity, 5)) |>
+  group_by(severity_q, treated) |>
+  summarise(n = n(), risk = mean(died), .groups = "drop")
+sim_q
+
+p_sim <- ggplot(sim_q, aes(x = severity_q, y = risk, colour = factor(treated))) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  labs(x = "Severity group (1 = mildest, 5 = sickest)", y = "Risk of death",
+       colour = "Treated", title = "Risk of death by severity and treatment")
+p_sim
+```
+
+## Simulation 2 · Results · 결과
+
+:::: {.columns}
+::: {.column width="38%"}
+```{r}
+#| label: sim-strata-out
+#| echo: false
+sim_q |> mutate(risk = round(risk, 2))
+```
+:::
+::: {.column width="62%"}
+```{r}
+#| label: sim-plot-out
+#| echo: false
+#| fig-width: 6.5
+#| fig-height: 3.1
+p_sim
+```
+:::
+::::
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- Risk of death rises steeply with severity, but within each severity group the two lines **almost coincide** → no treatment effect, the truth we built in.
+- The group sizes (`n`) show why the crude comparison misled: mild groups are mostly untreated, severe groups mostly treated.
+- With **one** confounder, stratifying is easy. The RHC data have **50** — the propensity score handles them all at once.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**같은 중증도끼리** 비교하면 차이가 사라집니다. 성향점수는 이런 비교를 **많은 변수에 대해 한 번에** 합니다.
+:::
+
+## Why not just adjust in a regression? · 회귀모형으로 보정하면 안 되나요?
+
+You can, and the best analyses often combine both. But regression alone has limitations:
+
+| Issue | Outcome regression | Propensity score methods |
+|---|---|---|
+| Many confounders, few outcome events | Risk of overfitting | Models *treatment*, often more common than the outcome |
+| Treated and untreated patients with **little overlap in characteristics** | Extrapolates from the model, without warning | PS plots show where comparable patients are missing |
+| Was confounding removed? | No direct check; relies on a correct model | Check covariate balance (SMD, Love plot) |
+| Revising the analysis | Can be pre-specified, but checking or changing the model means refitting with the outcome | Check and revise using only treatment and covariates; outcome used once, at the end |
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+Regression can also be pre-specified without seeing outcomes. The advantage of propensity scores is that the *design* can be checked and improved before the outcome is used, as in an RCT. Neither approach handles **unmeasured** confounding.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+성향점수 방법은 결과를 사용하기 **전에** 중첩과 균형을 확인하고 설계를 개선할 수 있습니다.
+:::
+
+## Exact matching 1 · One and three variables · 정확 매칭
+
+**Exact matching** groups RHC and non-RHC patients who have **identical** values on the chosen variables; patients in a group with no one from the other treatment group are dropped. How far does it get us?
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (5 min)"}
+1. Exact-match on **sex** only. *(`matchit()` with `method = "exact"`)*
+2. What percentage of the `r sum(rhc$treat)` RHC patients found a match? *(`summary()`, element `$nn`)*
+3. Repeat with **sex + `cat1` + `dnr1`**.
+:::
+
+```{r}
+#| label: exact-1-3
+#| output: false
+ex1 <- matchit(treat ~ sex, data = rhc, method = "exact")
+summary(ex1)$nn
+pct1 <- summary(ex1)$nn["Matched", "Treated"] / sum(rhc$treat)
+
+ex3 <- matchit(treat ~ sex + cat1 + dnr1, data = rhc, method = "exact")
+summary(ex3)$nn
+pct3 <- summary(ex3)$nn["Matched", "Treated"] / sum(rhc$treat)
+c(pct1, pct3)
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**정확 매칭**: 선택한 변수의 값이 **완전히 같은** 환자끼리 묶습니다. 변수 1개, 3개로 해 보세요.
+:::
+
+## Exact matching 1 · Results: reading `summary()` · 결과 읽기
+
+```{r}
+#| label: exact-1-summary
+#| echo: false
+s1 <- summary(ex1)
+round(s1$sum.all[, c("Means Treated", "Means Control", "Std. Mean Diff.", "eCDF Max")], 3)
+round(s1$sum.matched[, c("Means Treated", "Means Control", "Std. Mean Diff.", "Std. Pair Dist.")], 3)
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **Rows:** `sex` is a factor, so each level gets a 0/1 indicator. The **mean of a 0/1 variable is a proportion**: `r percent(s1$sum.all["sexFemale", "Means Treated"], 0.1)` of RHC patients vs `r percent(s1$sum.all["sexFemale", "Means Control"], 0.1)` of controls are female.
+- **Std. Mean Diff.** (SMD): `r sprintf("%.3f", s1$sum.all["sexFemale", "Std. Mean Diff."])` before matching — just under 0.1. MatchIt divides by the **RHC group's SD**, because the target population is the RHC patients (the ATT, defined later). **eCDF Max:** the largest gap between the two distributions; for a 0/1 variable it equals the difference in proportions.
+- **After matching**, the proportions are identical and every statistic is 0 (`-0` is rounding). **Std. Pair Dist.** = average difference within matched groups: 0, because patients match exactly. `Var. Ratio` (not shown) is blank for binary variables.
+- **Why did the control mean change?** Exact matching keeps **everyone** in a group and **re-weights the controls** so they mirror the RHC group (e.g., female controls get a slightly smaller weight).
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+0/1 변수의 평균 = **비율**. 정확 매칭은 대조군에 **가중치**를 주어 RHC군과 같은 비율이 되게 합니다. 매칭 후 SMD = 0.
+:::
+
+## Exact matching 1 · Results: sample sizes · 표본 크기
+
+```{r}
+#| label: exact-nn
+#| echo: false
+nn1 <- summary(ex1)$nn; nn3 <- summary(ex3)$nn
+nn1
+nn3
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **Sex only** (first table): every patient is matched — all `r sum(rhc$treat)` RHC patients and all `r sum(rhc$treat == 0)` controls.
+- **Sex + `cat1` + `dnr1`** (second table): still **all RHC patients** matched. **`r nn3["Unmatched", "Control"]` controls** are unmatched: they belong to a combination (e.g., men with lung cancer and a DNR order) that **no RHC patient** has, so there is no one to compare them with.
+- **ESS** (effective sample size) = $(\sum w)^2 / \sum w^2$. The `r nn3["Matched", "Control"]` matched controls carry **unequal weights** (large where there are many RHC patients per control, e.g., sepsis; small where there are few, e.g., COPD), so they are worth only about **`r round(nn3["Matched (ESS)", "Control"])`** equally weighted patients. Lower ESS = less information = wider confidence intervals.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+변수 3개: RHC 환자는 모두 매칭, 대조군 `r nn3["Unmatched", "Control"]`명은 같은 조합의 RHC 환자가 없어 제외. **유효 표본 크기(ESS)**는 가중치가 불균등할수록 작아집니다.
+:::
+
+## Exact matching 2 · Ten variables · 변수 10개
+
+Continuous variables almost never match exactly, so first cut them into **quintiles** (5 groups).
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (5 min)"}
+1. Create quintile versions of `age`, `aps1`, `meanbp1`, `pafi1`, `crea1` in a new data set `rhc_q`. *(`ntile()`)*
+2. Exact-match on 10 variables: `sex`, `cat1`, `dnr1`, `ca`, `race`, plus your 5 quintile variables.
+3. What percentage of RHC patients found a match now?
+:::
+
+```{r}
+#| label: exact-10
+#| output: false
+rhc_q <- rhc |>
+  mutate(age_q = ntile(age, 5), aps_q = ntile(aps1, 5), bp_q = ntile(meanbp1, 5),
+         pafi_q = ntile(pafi1, 5), crea_q = ntile(crea1, 5))
+ex10 <- matchit(treat ~ sex + cat1 + dnr1 + ca + race + age_q + aps_q + bp_q + pafi_q + crea_q,
+                data = rhc_q, method = "exact")
+summary(ex10)$nn
+pct10 <- summary(ex10)$nn["Matched", "Treated"] / sum(rhc$treat)
+pct10
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+연속형 변수는 5분위로 나눈 뒤, 10개 변수로 정확 매칭해 보세요.
+:::
+
+## Exact matching · Results: the curse of dimensionality · 차원의 저주
+
+```{r}
+#| label: exact-all
+#| echo: false
+ex_vars <- c("sex", "cat1", "dnr1", "ca", "race", "age_q", "aps_q", "bp_q", "pafi_q", "crea_q")
+pct_curve <- map_dbl(seq_along(ex_vars), function(k) {
+  m <- matchit(reformulate(ex_vars[1:k], "treat"), data = rhc_q, method = "exact")
+  summary(m)$nn["Matched", "Treated"] / sum(rhc_q$treat)
+})
+```
+
+:::: {.columns}
+::: {.column width="58%"}
+```{r}
+#| label: exact-plot
+#| echo: false
+#| fig-width: 6.2
+#| fig-height: 3.0
+tibble(k = seq_along(ex_vars), pct = pct_curve, var = ex_vars) |>
+  ggplot(aes(k, pct)) +
+  geom_line(colour = "#ff79c6", linewidth = 1.2) + geom_point(colour = "#ff79c6", size = 3) +
+  geom_point(data = tibble(k = c(1, 3, 10), pct = c(pct1, pct3, pct10)),
+             colour = "#50fa7b", size = 5, shape = 21, stroke = 1.5) +
+  geom_text(aes(label = var), vjust = -1.1, size = 3, colour = "#f8f8f2") +
+  scale_y_continuous(labels = percent, limits = c(0, 1.1)) + scale_x_continuous(breaks = 1:10) +
+  labs(x = "Number of variables matched exactly", y = "RHC patients matched",
+       title = "Exact matching in the RHC data")
+```
+:::
+::: {.column width="42%"}
+| Variables | RHC patients matched |
+|---|---|
+| 1 | **`r percent(pct1, 1)`** |
+| 3 | **`r percent(pct3, 1)`** |
+| 10 | **`r percent(pct10, 1)`** |
+:::
+::::
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- With 1 or 3 variables, nearly every RHC patient finds an identical control. With **10**, only **`r percent(pct10, 1)`** do — the rest would be discarded. Green circles = your exercises.
+- With **50** covariates, exact matching is impossible: the **curse of dimensionality**.
+- Solution: summarize all covariates in **one number**, the propensity score, and match on that.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+변수가 많아지면 똑같은 환자를 찾을 수 없습니다 (**차원의 저주**). 그래서 모든 변수를 **하나의 점수**로 요약합니다.
+:::
+
+## Exact matching · What does a match look like? · 정확 매칭의 예
+
+Patients in the same exact-matching group share **sex, `cat1`, and `dnr1`**. Here are a few from one group (male, MOSF with sepsis, no DNR order):
+
+```{r}
+#| label: exact-rows
+#| echo: false
+md3 <- match.data(ex3)
+grp <- md3 |> filter(sex == "Male", cat1 == "MOSF w/Sepsis", dnr1 == "No")
+set.seed(7)
+ex_rows <- bind_rows(slice_sample(filter(grp, treat == 1), n = 3),
+                     slice_sample(filter(grp, treat == 0), n = 3)) |>
+  transmute(Group = if_else(treat == 1, "RHC", "No RHC"), sex, cat1, dnr1,
+            Age = round(age), `APACHE III` = aps1, `Mean BP` = meanbp1, `PaO2/FiO2` = round(pafi1))
+ex_rows |>
+  gt() |>
+  tab_style(style = cell_text(color = "#50fa7b", weight = "bold"),
+            locations = cells_body(columns = c(sex, cat1, dnr1))) |>
+  tab_style(style = cell_text(color = "#ff79c6", weight = "bold"),
+            locations = cells_body(columns = c(Age, `APACHE III`, `Mean BP`, `PaO2/FiO2`)))
+```
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (3 min)"}
+Extract the matched data from `ex3` (`match.data()`) and look at a few RHC and non-RHC patients in one `subclass`. Which variables are identical? Which are not?
+:::
+
+```{r}
+#| label: exact-rows-solution
+#| output: false
+md3 <- match.data(ex3)
+md3 |>
+  filter(subclass == 2) |>
+  group_by(swang1) |>
+  slice_head(n = 3) |>
+  ungroup() |>
+  select(subclass, swang1, weights, sex, cat1, dnr1, age, aps1, meanbp1, pafi1)
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **Green:** identical within the group — these are the matching variables.
+- **Pink:** age, severity (APACHE III), blood pressure, and oxygenation still differ a lot. Matching exactly on 3 variables leaves the other 47 unbalanced, and matching exactly on all 50 is impossible.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+매칭 변수(초록)는 같지만 나이·중증도·혈압·산소화(분홍)는 여전히 크게 다릅니다. 변수 3개로는 나머지 47개의 균형을 맞출 수 없습니다.
+:::
+
+## What is a propensity score? · 성향점수란?
+
+$$
+e(X) = \Pr(\text{Treatment} = 1 \mid X)
+$$
+
+The probability that a patient receives the treatment, **given their measured covariates** X (Rosenbaum & Rubin, 1983).
+
+:::: {.columns}
+::: {.column width="55%"}
+**Balancing property · 균형 성질**
+
+Patients with the **same PS** have, on average, the **same distribution of X**, whether or not they were treated.
+
+So, within PS-matched pairs, treatment is *as if* randomized — but **only with respect to measured X**.
+:::
+::: {.column width="45%"}
+**Ways to use a PS · 활용법**
+
+1. **Matching** ← today
+2. **Weighting (IPTW)** ← today
+3. Stratification
+4. Covariate adjustment
+:::
+::::
+
+::: {.callout-tip title="🧑‍💻 Check yourself · 확인 (1 min)"}
+A patient has PS = 0.05. What does that mean in words? Would you expect many such patients in the RHC group?
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**성향점수** = 측정된 공변량이 주어졌을 때 치료를 받을 확률. 성향점수가 같은 환자들은 공변량 분포가 비슷합니다 (**균형 성질**).
+:::
+
+## Key assumptions · 핵심 가정
+
+| Assumption | Meaning | In the RHC study |
+|---|---|---|
+| **Exchangeability** (교환가능성) | No unmeasured confounding | Is the doctor's impression of "how sick" in the data? |
+| **Positivity** (양수성) | Every type of patient could receive either treatment | Some patients would never get RHC (e.g., comfort care) |
+| **Consistency** (일치성) | The treatment is well defined | Is "RHC within 24 h" the same everywhere? |
+| **Correct PS model** | The model captures who gets treated | Judged by **balance**, not fit statistics |
+
+::: {.callout-important title="PS ≠ magic · 성향점수는 마법이 아닙니다"}
+Propensity scores balance only **measured** covariates. Unmeasured confounding remains possible → we will do a **sensitivity analysis** at the end.
+:::
+
+::: {.callout-tip title="🧑‍💻 Discuss · 토론 (2 min)"}
+Name one **unmeasured** factor that could affect both the decision to place an RHC and the risk of death.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+성향점수는 **측정된** 공변량만 균형을 맞춥니다. 교환가능성, 양수성, 일치성은 자료로 완전히 검증할 수 없습니다.
+:::
+
+## What effect are we estimating? · 추정 대상 (estimand)
+
+The **estimand** is the exact quantity we want to estimate. Two are common:
+
+:::: {.columns}
+::: {.column width="50%"}
+**ATE — Average Treatment Effect** · 평균처치효과
+
+The average effect of RHC **in all patients** in the study population.
+
+*Compare:* a world where **every** patient gets RHC vs a world where **no** patient gets RHC.
+:::
+::: {.column width="50%"}
+**ATT — Average Treatment effect in the Treated** · 처치군 평균처치효과
+
+The average effect of RHC **in the patients who actually received RHC**.
+
+*Compare:* what happened to RHC patients vs what **would have happened to the same patients** without RHC.
+:::
+::::
+
+**Potential outcomes:** each patient has two possible outcomes, $Y^1$ (with RHC) and $Y^0$ (without). We only ever observe one of them, so the other must be estimated from comparable patients.
+
+$$
+\text{ATE} = E[Y^1 - Y^0] \qquad\qquad \text{ATT} = E[Y^1 - Y^0 \mid \text{received RHC}]
+$$
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- ATE and ATT differ when the effect differs between the kinds of patients who get treated and those who don't. E.g., if RHC harms the sickest most, and RHC patients are sicker, the ATT shows more harm than the ATE.
+- **Matching** treated patients to controls estimates the **ATT**. **IPTW** (with 1/PS weights) estimates the **ATE**.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**ATE** = 모든 환자가 치료받은 경우와 아무도 받지 않은 경우의 평균 차이. **ATT** = 실제로 치료받은 환자에서, 치료를 받은 경우와 받지 않았을 경우의 평균 차이.
+:::
+
+## ATE or ATT: which do we want? · 어떤 것을 선택할까?
+
+:::: {.columns}
+::: {.column width="50%"}
+**Choose the ATT when… · ATT**
+
+- The question is about patients who **currently receive** the treatment: *"Is RHC helping or harming the patients we place it in?"*
+- Many untreated patients would **never** be candidates (e.g., mild illness, comfort care) — so "treat everyone" is not a realistic policy
+- Typical for **matching**
+:::
+::: {.column width="50%"}
+**Choose the ATE when… · ATE**
+
+- The question is a **policy for everyone**: *"Should all ICU patients like these receive RHC?"*
+- Every patient type could realistically receive either option (positivity holds for all)
+- Typical for **IPTW** and outcome regression
+:::
+::::
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+For RHC, the **ATT** is the more natural question: RHC is given to selected, unstable patients, and nobody proposes placing it in every ICU patient. We will estimate both and compare.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**ATT**: "현재 치료받는 환자에게 도움이 되는가?" **ATE**: "모든 환자에게 적용해야 하는가?" RHC 연구에서는 **ATT**가 더 자연스러운 질문입니다.
+:::
+
+## Positivity · 양수성
+
+**Definition** (Westreich & Cole, 2010): there must be both treated **and** untreated patients at every combination of the confounders — formally, $0 < \Pr(\text{treatment} \mid X) < 1$.
+
+:::: {.columns}
+::: {.column width="50%"}
+**Two kinds of violation · 두 가지 위반**
+
+- **Structural:** some patients *cannot* receive one option (e.g., RHC contraindicated, comfort care). More data does not help.
+- **Random (practical):** treatment was possible, but by chance few or no patients of that type received it (or did not).
+:::
+::: {.column width="50%"}
+**Which end of the PS matters? · 어느 쪽이 중요한가**
+
+- **ATT (matching):** every *treated* patient needs comparable controls → problems at the **high-PS** end.
+- **ATE (IPTW):** every patient needs comparable patients in *both* groups → problems at **both ends**.
+:::
+::::
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+A positivity problem means that, for some types of patients, the data contain **no information** about what would have happened under the other option. We will see it in the overlap plot (Step 2) and in the IPTW weights (Step 6).
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**양수성**: 모든 공변량 조합에 치료군과 비치료군이 모두 있어야 합니다. 매칭(ATT)은 성향점수가 **높은** 쪽, IPTW(ATE)는 **양쪽 끝** 모두가 중요합니다.
+:::
+
+## Measuring the effect · 효과 척도: RD, RR, OR
+
+For a yes/no outcome with risk $p_1$ (treated) and $p_0$ (untreated). Example: $p_1 = 0.38$, $p_0 = 0.31$.
+
+| Measure | Formula | Example | Say it as |
+|---|---|---|---|
+| **Risk difference (RD)** 위험차 | $p_1 - p_0$ | **0.07** | "7 **percentage points** higher" (absolute) |
+| **Risk ratio (RR)** 위험비 | $p_1 / p_0$ | **1.23** | "23% higher" (relative) |
+| **Odds ratio (OR)** 오즈비 | $\frac{p_1/(1-p_1)}{p_0/(1-p_0)}$ | **1.36** | "1.36 times the odds" |
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **No effect:** RD = 0, RR = 1, OR = 1.
+- **Percentage points ≠ percent:** 31% → 38% is +7 percentage points (RD), but a 23% relative increase (RR).
+- When the outcome is **common** (30-day mortality ≈ 33%), the OR is further from 1 than the RR and should not be read as a risk ratio.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**위험차** = 절대적 차이(%p), **위험비** = 상대적 차이, **오즈비** = 오즈의 비. 결과가 흔하면 오즈비는 위험비보다 1에서 더 멉니다.
+:::
+
+## Which measure when? · 어떤 척도를 쓸까?
+
+| Measure | Use it when… | Example |
+|---|---|---|
+| **Risk difference** | You want the **clinical or public-health impact**: extra (or fewer) events per 100 patients. $1 / \text{RD}$ = number needed to treat (or harm) | RD 0.07 → 1 extra death per $1/0.07 ≈ 14$ patients treated |
+| **Risk ratio** | You want the **relative strength** of an effect, or to compare groups with different baseline risks | "Risk of death was 23% higher with RHC" |
+| **Odds ratio** | The model is **logistic regression**, or the design is **case-control** (risks cannot be estimated). Close to the RR only if the outcome is **rare** (< ~10%) | Comparing with Connors et al., who reported an OR |
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+Report an **absolute** (RD) and a **relative** (RR) measure together. Today: RD and RR, plus the OR to compare with Connors et al.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**위험차**: 임상적 영향(NNT). **위험비**: 상대적 크기. **오즈비**: 로지스틱 회귀, 환자-대조군 연구. 절대적·상대적 척도를 **함께** 보고하세요.
+:::
+
+## The workflow · 분석 흐름
+
+```{r}
+#| label: workflow
+#| echo: false
+#| out-width: 100%
+#| fig-width: 10
+#| fig-height: 2.7
+wf <- tibble(
+  x = 1:7,
+  lab = c("0. Question\n(estimand)", "1. Covariates\n(pre-treatment\nonly)",
+          "2. Estimate PS\n(logistic\nregression)", "3. Match\n(nearest\n+ caliper)",
+          "4. Balance OK?\n(|SMD| < 0.1)", "5. Effect\n(outcome used\nonly here)",
+          "6. Sensitivity\n(IPTW,\nE-value)"),
+  col = c(rep("#bd93f9", 4), "#ffb86c", "#50fa7b", "#bd93f9"))
+p_wf <- ggplot(wf) +
+  geom_segment(data = wf[-7, ], aes(x = x + 0.42, xend = x + 0.58, y = 1, yend = 1),
+               arrow = arrow(length = unit(0.2, "cm"), type = "closed"), colour = "#ff79c6", linewidth = 1) +
+  geom_curve(aes(x = 5, y = 0.6, xend = 3, yend = 0.6), curvature = -0.35, colour = "#ffb86c",
+             linetype = 2, arrow = arrow(length = unit(0.2, "cm"))) +
+  annotate("text", x = 4, y = 0.3, label = "balance not OK: revise the PS model",
+           colour = "#ffb86c", size = 4) +
+  geom_label(aes(x, 1, label = lab), fill = "#44475a", colour = "#f8f8f2", label.size = 0,
+             size = 3.6, label.padding = unit(0.4, "lines"), lineheight = 0.95) +
+  geom_point(aes(x, 1.38), colour = wf$col, size = 3) +
+  coord_cartesian(xlim = c(0.5, 7.5), ylim = c(0.2, 1.45)) +
+  theme_void() + theme(plot.background = element_rect(fill = "#282a36", colour = NA))
+attr(p_wf, "keep_theme") <- TRUE
+p_wf
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- Steps **1–4 are the design stage**. Repeat them until balance is good — **without looking at the outcome**.
+- Step **5** uses the outcome once. Step **6** checks how robust the answer is.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+1–4단계 = **설계 단계**: 결과(사망)를 보지 않고 균형이 좋아질 때까지 반복합니다. 결과는 5단계에서 **한 번만** 사용합니다.
+:::
+
+# Part 2 · Hands-on: the RHC study {background-color="#44475a"}
+
+실습: 우심도자술(RHC) 자료
+
+## Step 1 · Choose covariates · 공변량 선택
+
+The starter script defines `covs`: the **50 baseline covariates** used by Connors et al.
+
+:::: {.columns}
+::: {.column width="50%"}
+**Include · 포함**
+
+- Measured **before** treatment (day 1)
+- Causes of the outcome and/or the treatment
+:::
+::: {.column width="50%"}
+**Exclude · 제외**
+
+- Anything measured **after** treatment (discharge date, length of stay)
+- The outcome itself
+:::
+::::
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (3 min)"}
+1. How many covariates are in `covs`?
+2. How many patients have a missing value in any of them? *(`complete.cases()`)*
+3. Which variables in the whole data set have missing values? *(`is.na()`, `colSums()`)*
+:::
+
+```{r}
+#| label: covs-check
+#| output: false
+length(covs)
+sum(!complete.cases(rhc[, covs]))
+miss <- colSums(is.na(rhc))
+miss[miss > 0]
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**처치 이전**에 측정된 변수만 사용합니다. 처치 이후 변수를 넣으면 치료 효과의 일부를 지워버립니다.
+:::
+
+## Step 1 · Results · 결과
+
+```{r}
+#| label: covs-check-out
+#| echo: false
+length(covs)
+sum(!complete.cases(rhc[, covs]))
+miss[miss > 0]
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **`r length(covs)`** covariates, with **`r sum(!complete.cases(rhc[, covs]))`** missing values → every patient can be used. Real EHR data are rarely this complete.
+- Missing values occur only in variables we do **not** use: `cat2` (secondary diagnosis), `adld3p` (daily activities), `urin1` (urine output), `dschdte` (discharge date, measured after treatment), and `dthdte` (date of death — missing for survivors).
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+사용할 공변량에는 결측치가 없습니다. 실제 EHR 자료에서는 **결측치 처리**가 중요한 문제입니다.
+:::
+
+## Step 1 · Table 1 · 기초특성표
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (6 min)"}
+Make a "Table 1" comparing RHC and non-RHC patients on these 10 covariates:
+
+`age, sex, cat1, dnr1, ca, aps1, meanbp1, pafi1, hrt1, surv2md1`
+
+1. Summarize by treatment group, with continuous variables as mean (SD). *(gtsummary: `tbl_summary()`)*
+2. Add **p-values**, using a t-test for continuous variables and letting gtsummary choose the test for categorical ones. *(`add_p()`)*
+3. Add the **standardized mean difference (SMD)**. *(`add_smd()` from the starter script)*
+4. Save it as `tbl_before`.
+:::
+
+::: {.callout-warning title="💡 Hint · 힌트"}
+`add_p(test = all_continuous() ~ "t.test")`. For categorical variables gtsummary picks the chi-squared test, or **Fisher's exact test** when some categories are rare (as in `cat1`). With 5,735 patients Fisher's test runs out of memory unless it is **simulated**: add `test.args = all_tests("fisher.test") ~ list(simulate.p.value = TRUE)`.
+:::
+
+```{r}
+#| label: table1
+#| output: false
+key_vars <- c("age", "sex", "cat1", "dnr1", "ca", "aps1", "meanbp1", "pafi1", "hrt1", "surv2md1")
+var_labels <- list(age ~ "Age (years)", sex ~ "Sex", cat1 ~ "Primary diagnosis", dnr1 ~ "DNR order",
+                   ca ~ "Cancer", aps1 ~ "APACHE III score", meanbp1 ~ "Mean blood pressure (mmHg)",
+                   pafi1 ~ "PaO2/FiO2 ratio", hrt1 ~ "Heart rate (/min)",
+                   surv2md1 ~ "Predicted 2-month survival")
+
+tbl_before <- rhc |>
+  select(swang1, all_of(key_vars)) |>
+  tbl_summary(by = swang1, label = var_labels,
+              statistic = all_continuous() ~ "{mean} ({sd})") |>
+  add_p(test = all_continuous() ~ "t.test",
+        test.args = all_tests("fisher.test") ~ list(simulate.p.value = TRUE)) |>
+  add_smd() |>
+  bold_labels()
+tbl_before
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+두 군의 기초특성, **p-값**, **표준화 평균차이(SMD)**를 비교하는 표를 만드세요.
+:::
+
+## Step 1 · Table 1 · Results · 결과
+
+```{r}
+#| label: table1-out
+#| echo: false
+tbl_before
+```
+
+## Step 1 · Table 1 · Interpretation · 해석
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- Continuous variables are mean (SD); categorical variables are n (%).
+- **SMD** = difference between groups in standard-deviation units (No RHC minus RHC). Look at its **absolute value**: above **0.1** means meaningful imbalance. For a categorical variable, one SMD summarizes all categories.
+- RHC patients are clearly **sicker**:
+  - APACHE III: `r round(mean(rhc$aps1[rhc$treat == 1]))` vs `r round(mean(rhc$aps1[rhc$treat == 0]))` (|SMD| = 0.50)
+  - Mean blood pressure: `r round(mean(rhc$meanbp1[rhc$treat == 1]))` vs `r round(mean(rhc$meanbp1[rhc$treat == 0]))` mmHg; PaO₂/FiO₂ (oxygenation) is lower
+  - Sepsis with organ failure (MOSF w/Sepsis): `r percent(mean(rhc$cat1[rhc$treat == 1] == "MOSF w/Sepsis"), 1)` vs `r percent(mean(rhc$cat1[rhc$treat == 0] == "MOSF w/Sepsis"), 1)`; DNR orders: `r percent(mean(rhc$dnr1[rhc$treat == 1] == "Yes"), 1)` vs `r percent(mean(rhc$dnr1[rhc$treat == 0] == "Yes"), 1)`
+- One SMD per variable here (e.g., primary diagnosis 0.58 summarizes all 9 categories); later, cobalt shows one SMD **per category**.
+- **p-values vs SMD:** age differs by only 1 year (|SMD| = 0.06, negligible), yet p = `r sprintf("%.3f", t.test(age ~ treat, data = rhc)$p.value)` — "significant" only because the sample is large. This is why we judge balance by the SMD.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+RHC 환자가 **더 위중**합니다. 나이는 차이가 1세에 불과하지만(SMD 0.06) p-값은 유의합니다 → 표본이 크면 작은 차이도 유의해지므로 균형은 **SMD**로 판단합니다.
+:::
+
+## Step 1 · The standardized mean difference · 표준화 평균차이
+
+**Continuous variable** (pooled SD):
+$$
+\text{SMD} = \frac{\bar{x}_{\text{RHC}} - \bar{x}_{\text{no RHC}}}{\sqrt{(s_{\text{RHC}}^2 + s_{\text{no RHC}}^2)/2}}
+$$
+
+**Binary variable** with proportions $p_1$ (RHC) and $p_0$ (no RHC), since the variance of a 0/1 variable is $p(1-p)$:
+$$
+\text{SMD} = \frac{p_1 - p_0}{\sqrt{\big(p_1(1-p_1) + p_0(1-p_0)\big)/2}}
+$$
+
+- The difference in means in **standard-deviation units** → comparable across variables measured in different units. **|SMD| < 0.1** = good balance.
+- **Why not p-values?** They depend on sample size: with 5,735 patients tiny differences are "significant" (like age in Table 1), and after matching real imbalance may look "non-significant".
+
+::: {.callout-tip title="🧑‍💻 Check yourself · 확인 (2 min)"}
+From Table 1: APACHE III is 61 (SD 20) with RHC and 51 (SD 19) without. Calculate the SMD by hand. Is it above 0.1?
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**SMD** = 평균(또는 비율) 차이를 표준편차로 나눈 값. **0.1 미만**이면 균형. p-값은 표본 크기에 따라 달라지므로 균형 판단에 쓰지 않습니다.
+:::
+
+## Step 1 · SMD for all 50 covariates · 모든 공변량
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (6 min)"}
+1. Compute the SMD for **all** covariates in `covs`, with a 0.1 threshold. Save as `bal_before`. *(cobalt: `bal.tab()`)*
+2. How many covariate terms are not balanced?
+3. Plot the 15 largest |SMD| values as dots, with a line at 0.1. Save as `p_smd`.
+:::
+
+::: {.callout-warning title="💡 Hint · 힌트"}
+`bal.tab()` needs the covariates and the treatment vector. Use `binary = "std"` so binary variables also get an SMD. The SMDs are in `bal_before$Balance`.
+:::
+
+```{r}
+#| label: smd-all
+#| output: false
+bal_before <- bal.tab(rhc[, covs], treat = rhc$treat,
+                      binary = "std", s.d.denom = "pooled", thresholds = c(m = 0.1))
+bal_before$Balanced.mean.diffs
+
+p_smd <- bal_before$Balance |>
+  rownames_to_column("covariate") |>
+  slice_max(abs(Diff.Un), n = 15) |>
+  ggplot(aes(abs(Diff.Un), reorder(covariate, abs(Diff.Un)))) +
+  geom_vline(xintercept = 0.1, linetype = 2, colour = "orange") +
+  geom_point(size = 3, colour = "#ff79c6") +
+  labs(x = "|SMD| before matching", y = NULL, title = "15 most imbalanced covariates")
+p_smd
+```
+
+## Step 1 · SMD · Results · 결과
+
+:::: {.columns}
+::: {.column width="38%"}
+```{r}
+#| label: smd-all-out
+#| echo: false
+bal_before$Balanced.mean.diffs
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- Each category of a factor counts separately: **`r nrow(bal_before$Balance)`** terms.
+- **`r sum(bal_before$Balance$M.Threshold.Un == "Not Balanced, >0.1", na.rm = TRUE)`** have |SMD| > 0.1.
+- The largest imbalances are all **severity markers**: APACHE III, blood pressure, oxygenation, sepsis.
+:::
+:::
+::: {.column width="62%"}
+```{r}
+#| label: smd-plot-out
+#| echo: false
+#| fig-width: 6
+#| fig-height: 4.0
+p_smd
+```
+:::
+::::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+매칭 전 `r nrow(bal_before$Balance)`개 항목 중 `r sum(bal_before$Balance$M.Threshold.Un == "Not Balanced, >0.1", na.rm = TRUE)`개가 불균형이며, 대부분 **중증도** 관련 변수입니다.
+:::
+
+## Two tools for every effect estimate · 효과 추정 도구
+
+From here on, every effect is estimated the same way: **fit a model (`lm()` or `glm()`), then call `avg_comparisons()`** (package **marginaleffects**).
+
+:::: {.columns}
+::: {.column width="50%"}
+**What `avg_comparisons()` does · 하는 일**
+
+1. Predict each patient's risk **as if treated** (`treat = 1`)
+2. Predict again **as if untreated** (`treat = 0`)
+3. **Average** each over the chosen patients (all → ATE; treated → ATT, via `newdata`)
+4. **Compare** the averages: RD (default), RR, or OR (`comparison`)
+
+…and computes the **standard error** you choose (`vcov`).
+:::
+::: {.column width="50%"}
+**Why robust standard errors? · 강건 표준오차**
+
+- Ordinary SEs assume equal variance for everyone. For a 0/1 outcome the variance is $p(1-p)$ and differs between groups → ordinary SEs are wrong.
+- **Robust ("sandwich") SEs**, `vcov = "HC3"`, fix this. HC3 adds a small-sample correction and is the default in the **sandwich** package; with 5,735 patients all robust versions agree.
+- **Cluster-robust SEs**, `vcov = ~subclass`, also account for matched pairs (Step 5).
+:::
+::::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**`avg_comparisons()`**: 각 환자의 위험을 치료한 경우와 치료하지 않은 경우로 예측해 평균을 비교합니다. **강건 표준오차**: 0/1 결과에서는 분산이 군마다 다르므로 사용합니다.
+:::
+
+## The crude comparison · 단순 비교
+
+What would we conclude if we ignored confounding?
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (5 min)"}
+1. Compute the number of patients, deaths, and 30-day risk of death in each group.
+2. Estimate the **crude risk difference** with a 95% CI, using a linear model of `died30` on `treat` and robust standard errors. Save as `crude`.
+:::
+
+::: {.callout-warning title="💡 Hint · 힌트"}
+`avg_comparisons()` (marginaleffects) gives the risk difference for `treat`. Use `vcov = "HC3"` for robust standard errors.
+:::
+
+```{r}
+#| label: crude
+#| output: false
+crude_tab <- rhc |>
+  group_by(swang1) |>
+  summarise(n = n(), deaths = sum(died30), risk30 = mean(died30))
+crude_tab
+
+crude_fit <- lm(died30 ~ treat, data = rhc)
+crude <- avg_comparisons(crude_fit, variables = "treat", vcov = "HC3")
+crude
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+교란을 무시한 **단순 비교**입니다. 나중에 보정한 결과와 비교할 기준이 됩니다.
+:::
+
+## The crude comparison · Results · 결과
+
+```{r}
+#| label: crude-out
+#| echo: false
+crude_tab
+crude
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- 30-day mortality was **`r percent(crude_tab$risk30[2], 0.1)`** with RHC and **`r percent(crude_tab$risk30[1], 0.1)`** without.
+- Reading the `avg_comparisons()` output:
+  - `Estimate` = risk difference = **`r sprintf("%.1f", 100 * crude$estimate)` percentage points**
+  - `2.5 %` to `97.5 %` = 95% CI: **`r sprintf("%.1f", 100 * crude$conf.low)` to `r sprintf("%.1f", 100 * crude$conf.high)`** points
+  - `Pr(>|z|)` = p-value. `S` = $-\log_2(p)$, evidence against "no difference" in bits: as surprising as `S` heads in a row from a fair coin (p = 0.05 ≈ 4 heads)
+- This is an **association**: RHC patients were much sicker, so part of this difference is confounding.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+단순 비교: RHC군의 30일 사망 위험이 `r sprintf("%.1f", 100 * crude$estimate)`%p 높습니다. 그러나 **중증도의 영향이 섞여** 있습니다.
+:::
+
+## Step 2 · Estimate the propensity score · 성향점수 추정
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (6 min)"}
+1. Fit a **logistic regression** of `treat` on all 50 covariates. Save as `ps_model`. *(`glm()`; `reformulate()` builds a formula from `covs`)*
+2. Save each patient's predicted probability of RHC as a new column `ps`. *(`predict()`)*
+3. Summarize the PS (mean, median, min, max) by treatment group.
+4. Now let **MatchIt** estimate the same PS, without matching yet: `matchit()` with `method = NULL` and `distance = "glm"`. The PS is stored in `$distance`. Is it identical to yours?
+:::
+
+::: {.callout-warning title="💡 Hint · 힌트"}
+`predict()` returns log-odds unless you ask for `type = "response"`.
+:::
+
+```{r}
+#| label: ps-model
+#| output: false
+ps_formula <- reformulate(covs, response = "treat")
+ps_model   <- glm(ps_formula, family = binomial, data = rhc)
+rhc$ps     <- predict(ps_model, type = "response")
+
+ps_summary <- rhc |>
+  group_by(swang1) |>
+  summarise(mean_ps = mean(ps), median_ps = median(ps), min_ps = min(ps), max_ps = max(ps))
+ps_summary
+
+# Same PS from MatchIt (no matching yet)
+m0 <- matchit(ps_formula, data = rhc, method = NULL, distance = "glm")
+max(abs(m0$distance - rhc$ps))      # difference between the two: essentially 0
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+성향점수 모형 = **치료 여부**를 종속변수로 하는 로지스틱 회귀. `glm()`으로 직접 추정하거나, **MatchIt**이 내부에서 같은 `glm()`으로 추정합니다.
+:::
+
+## Step 2 · Results · 결과
+
+```{r}
+#| label: ps-model-out
+#| echo: false
+ps_summary
+max(abs(m0$distance - rhc$ps))
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- Each patient now has a PS: the estimated probability of receiving RHC given their 50 covariates.
+- The average PS is **`r sprintf("%.2f", ps_summary$mean_ps[2])`** for RHC patients and **`r sprintf("%.2f", ps_summary$mean_ps[1])`** for non-RHC patients: the model separates the groups, as expected. The ranges overlap widely, so comparable patients exist in both groups.
+- The largest difference between your `glm()` PS and MatchIt's PS is essentially **0**: `matchit()` fits the same logistic regression internally. In practice you can let MatchIt do it; **cobalt** then checks balance but does not estimate the PS.
+- The PS model's **only job is to create balance**. Do not interpret its coefficients as causal, and do not drop "non-significant" variables.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+`glm()`과 MatchIt의 성향점수는 **동일**합니다. 성향점수 모형의 목표는 예측 정확도가 아니라 **공변량 균형**입니다.
+:::
+
+## Step 2 · Who gets RHC? · 어떤 환자가 RHC를 받나?
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (4 min)"}
+1. Turn `ps_model` into a table of **odds ratios** with 95% CIs. *(broom: `tidy()`)*
+2. Drop the intercept and keep the **8 strongest** predictors (largest |z| statistic). Save as `ps_or`.
+3. Discuss: do these make clinical sense?
+:::
+
+```{r}
+#| label: ps-or
+#| output: false
+ps_or <- tidy(ps_model, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  slice_max(abs(statistic), n = 8) |>
+  select(term, OR = estimate, conf.low, conf.high, p.value)
+ps_or
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+성향점수 모형의 오즈비로 **어떤 환자가 RHC를 받았는지** 살펴봅니다.
+:::
+
+## Step 2 · Who gets RHC? · Results · 결과
+
+```{r}
+#| label: ps-or-out
+#| echo: false
+ps_or |>
+  gt() |> fmt_number(c(OR, conf.low, conf.high), decimals = 3) |>
+  fmt_scientific(p.value, decimals = 1) |>
+  tab_header("Strongest predictors of receiving RHC")
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- OR > 1 → more likely to receive RHC; OR < 1 → less likely.
+- Continuous variables are **per 1 unit**, so their ORs are close to 1. For PaO₂/FiO₂ (OR 0.995), a value 100 units lower raises the odds of RHC about **1.6-fold**.
+- **More RHC:** worse oxygenation, lower blood pressure, cardiovascular diagnosis (`cardYes`, OR 1.75), sepsis with organ failure (OR 1.71).
+- **Less RHC:** a DNR order (OR 0.51).
+- Clinically sensible: RHC went to **unstable** patients receiving full treatment.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+산소화가 나쁘고 혈압이 낮은 **불안정한 환자**가 RHC를 더 많이 받았고, DNR 환자는 덜 받았습니다.
+:::
+
+## Step 2 · Check overlap · 중첩 확인
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (4 min)"}
+1. Plot the **distribution of the PS** for each treatment group in one graph. Save as `p_overlap`. *(`geom_density()`)*
+2. How many RHC and non-RHC patients have a PS above 0.9?
+:::
+
+```{r}
+#| label: ps-overlap
+#| output: false
+high_ps <- count(rhc, swang1, ps > 0.9)
+high_ps
+
+p_overlap <- ggplot(rhc, aes(x = ps, fill = swang1)) +
+  geom_density(alpha = 0.5, colour = NA) +
+  labs(x = "Propensity score", y = "Density", fill = NULL,
+       title = "Propensity score distribution by group")
+p_overlap
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+두 군의 성향점수 분포가 **겹쳐야(overlap)** 비교가 가능합니다.
+:::
+
+## Step 2 · Overlap · Results · 결과
+
+:::: {.columns}
+::: {.column width="60%"}
+```{r}
+#| label: ps-overlap-out
+#| echo: false
+#| fig-width: 6.5
+#| fig-height: 3.2
+p_overlap
+```
+:::
+::: {.column width="40%"}
+```{r}
+#| label: ps-high-out
+#| echo: false
+high_ps
+```
+:::
+::::
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- RHC patients (pink) have **higher** propensity scores, as expected.
+- The curves **overlap** over most of the range, so matching is feasible.
+- Above PS 0.9 there are **`r high_ps$n[high_ps$swang1 == "RHC" & high_ps[["ps > 0.9"]]]`** RHC patients but only **`r high_ps$n[high_ps$swang1 == "No RHC" & high_ps[["ps > 0.9"]]]`** controls: the patients **most strongly predicted to receive RHC** have few comparable controls, so some will go unmatched (a **positivity** problem). Who these patients are, we check in Step 3.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+RHC를 받을 가능성이 **가장 높은** 환자들은 비교할 대조군이 거의 없습니다 → **양수성** 문제. 이들이 어떤 환자인지는 3단계에서 확인합니다.
+:::
+
+## How nearest-neighbour matching works · 최근접 이웃 매칭의 원리
+
+A toy example of **1:1** nearest-neighbour matching (one control per RHC patient): 5 RHC patients and 8 controls, placed by their **logit PS**. Caliper = 0.3.
+
+```{r}
+#| label: nn-toy
+#| echo: false
+#| out-width: 100%
+#| fig-width: 11
+#| fig-height: 2.9
+tr <- tibble(id = paste0("T", 1:5), x = c(-1.0, 0.2, 0.9, 1.5, 3.2))
+co <- tibble(id = paste0("C", 1:8), x = c(-1.3, -0.9, -0.2, 0.1, 0.35, 1.0, 1.7, 2.1))
+pairs <- tibble(t = c(-1.0, 0.2, 0.9, 1.5), c = c(-0.9, 0.1, 1.0, 1.7))
+used <- co$x %in% pairs$c
+p_nn <- ggplot() +
+  annotate("rect", xmin = 3.2 - 0.3, xmax = 3.2 + 0.3, ymin = -0.25, ymax = 1.25,
+           fill = "#ffb86c", alpha = 0.15) +
+  annotate("text", x = 3.2, y = -0.45, label = "caliper: no control within 0.3", colour = "#ffb86c", size = 3.8) +
+  geom_segment(data = pairs, aes(x = t, xend = c, y = 1, yend = 0), colour = "#50fa7b", linewidth = 1) +
+  geom_point(data = tr, aes(x, 1), colour = "#ff79c6", size = 6) +
+  geom_point(data = co, aes(x, 0), colour = ifelse(used, "#8be9fd", "#6272a4"), size = 6) +
+  geom_text(data = tr, aes(x, 1, label = id), colour = "#282a36", size = 3, fontface = "bold") +
+  geom_text(data = co, aes(x, 0, label = id), colour = "#282a36", size = 3, fontface = "bold") +
+  annotate("text", x = -1.9, y = c(1, 0), label = c("RHC", "No RHC"), colour = c("#ff79c6", "#8be9fd"),
+           size = 4.5, hjust = 1, fontface = "bold") +
+  annotate("segment", x = -1.5, xend = 3.6, y = -0.75, yend = -0.75, colour = "#f8f8f2",
+           arrow = arrow(length = unit(0.2, "cm"))) +
+  annotate("text", x = 1, y = -0.95, label = "logit(PS): higher = more likely to receive RHC", colour = "#f8f8f2", size = 3.8) +
+  coord_cartesian(xlim = c(-2.6, 3.7), ylim = c(-1.05, 1.3)) +
+  theme_void() + theme(plot.background = element_rect(fill = "#282a36", colour = NA))
+attr(p_nn, "keep_theme") <- TRUE
+p_nn
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+1. MatchIt starts with the RHC patient that is **hardest to match** (highest PS, T5) and works down.
+2. Each RHC patient is paired with the control whose PS is **closest** (green lines) — the **nearest neighbour**.
+3. **1:1 without replacement:** each RHC patient gets **one** control, and a used control leaves the pool.
+4. If no control lies within the **caliper**, the RHC patient stays **unmatched** (T5). Unused controls (grey: C1, C3, C5, C8) are dropped.
+
+With `ratio = 2`, MatchIt repeats steps 1–3 to give each RHC patient a **second** control.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**1:1 최근접 이웃 매칭**: 각 RHC 환자에게 성향점수가 가장 가까운 대조군 **한 명**을 짝지어 줍니다. 사용된 대조군은 다시 쓰지 않으며(비복원), 캘리퍼 안에 대조군이 없으면 제외됩니다.
+:::
+
+## Step 3 · Match · 매칭
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (5 min)"}
+Match RHC patients to non-RHC patients with **`matchit()`** (MatchIt) using this design. Save as `m_out`, then look at how many patients were matched. *(`summary()`)*
+
+| Design choice | Setting | Argument |
+|---|---|---|
+| Matching method | nearest neighbour (closest PS first) | `method` |
+| Controls per RHC patient | **1** (1:1) | `ratio` |
+| Reuse of controls | **no** — each control used once (without replacement) | `replace` |
+| Distance | PS from logistic regression, on the **logit** scale | `distance`, `link` |
+| Caliper | **0.2** standard deviations of the logit PS | `caliper` |
+:::
+
+::: {.callout-warning title="💡 Hint · 힌트"}
+All arguments are described in `?matchit`; `link = "linear.logit"` gives the logit scale.
+:::
+
+```{r}
+#| label: match
+#| output: false
+m_out <- matchit(ps_formula, data = rhc,
+                 method = "nearest", distance = "glm", link = "linear.logit",
+                 caliper = 0.2, ratio = 1, replace = FALSE)
+m_out
+summary(m_out)$nn
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**최근접 이웃 1:1 매칭**: 각 RHC 환자에게 성향점수가 가장 가까운 비RHC 환자 한 명을 짝지어 줍니다. **캘리퍼** = 허용되는 최대 거리.
+:::
+
+## Step 3 · Match · Results · 결과
+
+```{r}
+#| label: match-out
+#| echo: false
+summary(m_out)$nn
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- `All`: before matching, `r summary(m_out)$nn["All", "Treated"]` RHC and `r summary(m_out)$nn["All", "Control"]` non-RHC patients.
+- `Matched`: **`r summary(m_out)$nn["Matched", "Treated"]` pairs**.
+- `Unmatched`: **`r summary(m_out)$nn["Unmatched", "Treated"]` RHC patients** had no control within the caliper (`r sprintf("%.2f", m_out$caliper)` on the logit scale) and were dropped; `r summary(m_out)$nn["Unmatched", "Control"]` controls were not needed.
+- `ESS` (effective sample size, $(\sum w)^2 / \sum w^2$) equals the matched number here, because in 1:1 matching every matched patient has weight 1.
+- Printing `m_out` also shows the **target estimand: ATT**.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+`r summary(m_out)$nn["Matched", "Treated"]`쌍이 매칭되었고, RHC 환자 `r summary(m_out)$nn["Unmatched", "Treated"]`명은 캘리퍼 안에 대조군이 없어 제외되었습니다.
+:::
+
+## Step 3 · What do matched pairs look like? · 매칭된 쌍의 예
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (4 min)"}
+Extract the matched data (`match.data(m_out)`, save as `md`). Each pair shares a `subclass` number. Look at pairs **1, 1351, and 664**: how close are their PS values? How close are their other covariates?
+:::
+
+```{r}
+#| label: pairs
+#| output: false
+md <- match.data(m_out)
+md |>
+  filter(subclass %in% c(1, 1351, 664)) |>     # one low-, one middle-, one high-PS pair
+  arrange(ps) |>
+  select(subclass, swang1, ps, age, cat1, aps1, meanbp1, pafi1)
+```
+
+```{r}
+#| label: pairs-out
+#| echo: false
+pick <- c(1, 1351, 664)
+md |>
+  filter(subclass %in% pick) |>
+  arrange(ps) |> arrange(match(subclass, pick), desc(treat)) |>
+  transmute(Pair = as.character(subclass), Group = as.character(swang1), PS = ps,
+            Age = round(age), Diagnosis = as.character(cat1), `APACHE III` = aps1,
+            `Mean BP` = meanbp1, `PaO2/FiO2` = round(pafi1)) |>
+  gt() |>
+  fmt_number(PS, decimals = 3) |>
+  tab_style(style = cell_text(color = "#50fa7b", weight = "bold"), locations = cells_body(columns = PS))
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- `subclass` is just a pair ID; these three were chosen because their PS is low, middle, and high. Within each pair the **PS is very close** (green) — always within the caliper.
+- Other covariates can still **differ** — different age, diagnosis, or severity. Matched patients are **not twins**.
+- That is fine: balance holds at the **group** level. Across all `r nrow(md) / 2` pairs the differences cancel out, as the balance checks in Step 4 show.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+쌍 안에서 성향점수는 매우 가깝지만 다른 변수는 다를 수 있습니다. 균형은 **개인**이 아니라 **집단** 수준에서 이루어집니다.
+:::
+
+## Step 3 · Who was left out? · 누가 제외되었나?
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (5 min)"}
+1. Among RHC patients, compare the **matched** and **unmatched** ones: number, mean PS, mean APACHE III. *(matched patients have a weight > 0 in `m_out$weights`)*
+2. Plot the PS distributions before and after matching as **mirrored histograms**. Save as `p_mirror`. *(cobalt: `bal.plot()`)*
+:::
+
+::: {.callout-warning title="💡 Hint · 힌트"}
+In `bal.plot()`, the PS is called `"distance"`; ask for both samples and a mirrored histogram (see `?bal.plot`).
+:::
+
+```{r}
+#| label: unmatched
+#| output: false
+md <- match.data(m_out)
+
+unmatched_tab <- rhc |>
+  mutate(matched = m_out$weights > 0) |>
+  filter(treat == 1) |>
+  group_by(matched) |>
+  summarise(n = n(), mean_ps = mean(ps), mean_aps = mean(aps1))
+unmatched_tab
+
+p_mirror <- bal.plot(m_out, var.name = "distance", which = "both",
+                     type = "histogram", mirror = TRUE,
+                     sample.names = c("Before matching", "After matching"))
+p_mirror
+```
+
+## Step 3 · Who was left out? · Results · 결과
+
+:::: {.columns}
+::: {.column width="55%"}
+```{r}
+#| label: mirror-out
+#| echo: false
+#| fig-width: 6
+#| fig-height: 3.2
+p_mirror
+```
+:::
+::: {.column width="45%"}
+```{r}
+#| label: unmatched-out
+#| echo: false
+unmatched_tab
+```
+:::
+::::
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **Histograms:** controls on top (red), RHC patients below (teal). Before matching the shapes differ; after matching they are near **mirror images**.
+- **Table:** the `r unmatched_tab$n[!unmatched_tab$matched]` unmatched RHC patients had a much higher PS (`r sprintf("%.2f", unmatched_tab$mean_ps[!unmatched_tab$matched])` vs `r sprintf("%.2f", unmatched_tab$mean_ps[unmatched_tab$matched])`) and, **on average**, higher APACHE III (`r round(unmatched_tab$mean_aps[!unmatched_tab$matched])` vs `r round(unmatched_tab$mean_aps[unmatched_tab$matched])`): they were **sicker** and almost always received RHC in practice.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+제외된 RHC 환자는 RHC를 받을 가능성이 가장 높았고, **평균적으로 더 위중**했습니다.
+:::
+
+## Step 3 · Why the left-out patients matter · 제외된 환자의 의미
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **The estimand changes.** We aimed for the ATT (all RHC patients), but estimate the effect in **RHC patients who could be matched**: `r summary(m_out)$nn["Matched", "Treated"]` of `r sum(rhc$treat)`.
+- **We learn nothing about the excluded group** — arguably the patients RHC was meant for. If RHC is more harmful in them, the true ATT is larger; if it helps them, smaller. The data cannot tell us.
+- **It is a positivity problem, not just a statistical step:** almost every patient this sick got RHC, so there is little information on what would have happened without it.
+- **What to do:** report how many were excluded and how they differ; state the population the result applies to; compare with a method that keeps everyone (full matching, weighting).
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+결과는 **매칭 가능한** RHC 환자에게만 적용됩니다. 제외된 환자에서의 효과는 알 수 없으므로 제외된 수와 특성을 보고하고, 모든 환자를 사용하는 방법과 비교하세요.
+:::
+
+## Step 4 · Check balance · 균형 진단
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (4 min)"}
+1. Compute the SMDs **before and after** matching for all covariates, with a 0.1 threshold. Save as `bal_after`. *(`bal.tab()` on `m_out`)*
+2. How many covariate terms are balanced after matching?
+3. What is the largest |SMD| after matching?
+:::
+
+::: {.callout-warning title="💡 Hint · 힌트"}
+By default `bal.tab()` shows only the **after**-matching SMDs. Add `un = TRUE` to also see the **before**-matching values (columns ending in `.Un`). This option is documented in `?display-options`, not in `?bal.tab`.
+:::
+
+```{r}
+#| label: baltab
+#| output: false
+bal_after <- bal.tab(m_out, un = TRUE, binary = "std", thresholds = c(m = 0.1))
+bal_after$Balanced.mean.diffs
+max(abs(bal_after$Balance$Diff.Adj[-1]))   # row 1 is the PS itself
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+매칭 후 **모든** 공변량의 |SMD|가 0.1 미만인지 확인합니다. 아직 결과(사망)는 보지 않습니다!
+:::
+
+## Step 4 · Balance · Results · 결과
+
+```{r}
+#| label: baltab-out
+#| echo: false
+bal_after$Balanced.mean.diffs
+max(abs(bal_after$Balance$Diff.Adj[-1]))
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- Before matching, `r sum(bal_before$Balance$M.Threshold.Un == "Not Balanced, >0.1", na.rm = TRUE)` of `r nrow(bal_before$Balance)` covariate terms were imbalanced (Step 1).
+- After matching, **all `r sum(bal_after$Balance$M.Threshold == "Balanced, <0.1", na.rm = TRUE)`** are balanced; the largest |SMD| is **`r sprintf("%.3f", max(abs(bal_after$Balance$Diff.Adj[-1])))`**.
+- If balance were poor, we would return to Step 2 (e.g., add splines or interactions to the PS model) — still without looking at the outcome.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+매칭 후 모든 항목의 |SMD| < 0.1 → **측정된** 공변량의 균형이 확보되었습니다.
+:::
+
+## Step 4 · Table 1 before and after · 매칭 전후 비교표
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (5 min)"}
+1. Make the same table as `tbl_before` (with p-values and SMD), but using the matched data `md`. Save as `tbl_after`.
+2. Combine the two tables side by side. Save as `tbl_merged`. *(gtsummary: `tbl_merge()`)*
+:::
+
+```{r}
+#| label: table1-after
+#| output: false
+tbl_after <- md |>
+  select(swang1, all_of(key_vars)) |>
+  tbl_summary(by = swang1, label = var_labels,
+              statistic = all_continuous() ~ "{mean} ({sd})") |>
+  add_p(test = all_continuous() ~ "t.test",
+        test.args = all_tests("fisher.test") ~ list(simulate.p.value = TRUE)) |>
+  add_smd() |>
+  bold_labels()
+
+tbl_merged <- tbl_merge(list(tbl_before, tbl_after),
+                        tab_spanner = c("**Before matching**", "**After matching**"))
+tbl_merged
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+논문에서는 **매칭 전후 기초특성표**를 나란히 보여줍니다.
+:::
+
+## Step 4 · Table 1 before and after · Results · 결과
+
+```{r}
+#| label: table1-after-out
+#| echo: false
+tbl_merged
+```
+
+## Step 4 · Table 1 before and after · Interpretation · 해석
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **Left:** the original groups (`r sum(rhc$treat == 0)` vs `r sum(rhc$treat == 1)`). **Right:** the matched groups (`r nrow(md) / 2` vs `r nrow(md) / 2`).
+- After matching, the groups look alike:
+  - APACHE III: `r round(mean(md$aps1[md$treat == 1]))` vs `r round(mean(md$aps1[md$treat == 0]))`; sepsis with organ failure: `r percent(mean(md$cat1[md$treat == 1] == "MOSF w/Sepsis"), 1)` vs `r percent(mean(md$cat1[md$treat == 0] == "MOSF w/Sepsis"), 1)`
+  - Every |SMD| is now below 0.1
+- **p-values:** most are now large, partly just because the sample is smaller. Yet APACHE III (p = `r sprintf("%.3f", t.test(aps1 ~ treat, data = md)$p.value)`) and PaO₂/FiO₂ (p = `r sprintf("%.3f", t.test(pafi1 ~ treat, data = md)$p.value)`) are still "significant" although their |SMD| is below 0.1. P-values are not a measure of balance; the SMD is.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+매칭 후 모든 |SMD| < 0.1입니다. 일부 p-값은 여전히 유의하지만 이는 균형의 척도가 아닙니다. 균형은 **SMD**로 판단합니다.
+:::
+
+## Step 4 · The cost of matching · 매칭의 대가
+
+We used **`r nrow(md)` of `r format(nrow(rhc), big.mark = ",")`** patients. Who was lost, and why does it matter?
+
+| Lost | Number | Implication |
+|---|---|---|
+| RHC patients with no comparable control | **`r summary(m_out)$nn["Unmatched", "Treated"]`** (`r percent(summary(m_out)$nn["Unmatched", "Treated"] / sum(rhc$treat), 1)` of RHC patients) | Those most strongly predicted to receive RHC, and **on average the sickest**. Our result does **not** apply to them: the estimand shifts from "all RHC patients" to "RHC patients who could be matched" |
+| Controls not needed | **`r summary(m_out)$nn["Unmatched", "Control"]`** | Their information is unused → **wider confidence intervals** (less precision) |
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **Generalizability:** if RHC works differently in these patients (more harm, or perhaps benefit), our estimate cannot show it. Report who was excluded.
+- **Precision:** fewer patients → more uncertainty.
+- **Alternatives that keep more patients:** matching with replacement, full matching, or weighting (IPTW, overlap weights). We try some of these next.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+RHC를 받을 가능성이 가장 높았고 평균적으로 더 위중한 RHC 환자 `r summary(m_out)$nn["Unmatched", "Treated"]`명이 제외되어 결과를 이들에게 **일반화할 수 없고**, 사용하지 않은 대조군 때문에 **정밀도**가 낮아집니다.
+:::
+
+## Step 4 · The Love plot · 러브 플롯
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (3 min)"}
+Draw a **Love plot**: the absolute SMD of every covariate before and after matching, with a line at 0.1, sorted by the imbalance before matching. Save as `p_love`. *(cobalt: `love.plot()`)*
+:::
+
+```{r}
+#| label: loveplot
+#| output: false
+p_love <- love.plot(m_out, binary = "std", abs = TRUE,
+                    thresholds = c(m = 0.1), var.order = "unadjusted",
+                    drop.distance = TRUE,
+                    colors = c("#ff5555", "#50fa7b"), shapes = c(16, 17),
+                    sample.names = c("Before", "After"))
+p_love
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**러브 플롯**: 모든 공변량의 매칭 전후 SMD를 한 그림에 보여줍니다.
+:::
+
+## Step 4 · Love plot · Results · 결과
+
+:::: {.columns}
+::: {.column width="58%"}
+```{r}
+#| label: loveplot-out
+#| echo: false
+#| fig-width: 6.5
+#| fig-height: 5.9
+love_top(bal_after)
+```
+:::
+::: {.column width="42%"}
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- Each row is one covariate term, sorted by imbalance before matching. To keep labels readable, the slide shows the **25 most imbalanced** of the 70 terms; your own plot shows all of them.
+- x-axis: |SMD|. Dashed line: 0.1.
+- **Red circles (before):** many far to the right (up to about 0.55).
+- **Green triangles (after):** all to the **left** of 0.1.
+- Matching balanced every **measured** covariate. Unmeasured ones cannot be checked.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+매칭 후(초록) 모든 점이 0.1 선 **왼쪽**에 있습니다 → 균형 확보.
+:::
+:::
+::::
+
+## Step 4 · Beyond the mean · 분포 전체 확인
+
+Equal means do not guarantee equal distributions.
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (4 min)"}
+1. Get the **variance ratios** (variance in RHC ÷ variance in controls) for `aps1`, `pafi1`, and `meanbp1`, before and after matching. *(`bal.tab()`; see its `stats` argument)*
+2. Plot the full distribution of `aps1` and of `pafi1` before and after matching. Show the two plots side by side. *(`bal.plot()`, patchwork)*
+:::
+
+```{r}
+#| label: balplot-vars
+#| output: false
+vr_tab <- bal.tab(m_out, stats = c("m", "v"), un = TRUE)$Balance[
+  c("aps1", "pafi1", "meanbp1"), c("Diff.Un", "Diff.Adj", "V.Ratio.Un", "V.Ratio.Adj")]
+vr_tab
+
+p_aps  <- bal.plot(m_out, var.name = "aps1",  which = "both",
+                   sample.names = c("Before", "After")) + labs(title = "APACHE III (aps1)")
+p_pafi <- bal.plot(m_out, var.name = "pafi1", which = "both",
+                   sample.names = c("Before", "After")) + labs(title = "PaO2/FiO2 (pafi1)")
+p_aps + p_pafi
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+평균뿐 아니라 **분포 전체**와 **분산비**도 확인합니다.
+:::
+
+## Step 4 · Beyond the mean · Results · 결과
+
+```{r}
+#| label: balplot-out
+#| echo: false
+#| layout-ncol: 2
+#| fig-width: 5.5
+#| fig-height: 2.3
+p_aps
+p_pafi
+```
+
+:::: {.columns}
+::: {.column width="40%"}
+```{r}
+#| label: vr-out
+#| echo: false
+round(vr_tab, 2)
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+매칭 후 분포가 겹치고 분산비가 1에 가깝습니다 → **분포 전체**가 비슷해졌습니다. PaO₂/FiO₂ 333 부근의 봉우리는 검사를 하지 않아 **정상값으로 채운 값**(결측)입니다.
+:::
+:::
+::: {.column width="60%"}
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **Plots** (red = no RHC, teal = RHC): RHC patients have higher APACHE III and lower PaO₂/FiO₂ before matching; after, the curves **overlap**.
+- **Table:** `Diff` = SMD, `V.Ratio` = variance ratio, before (`.Un`) and after (`.Adj`). A ratio near **1** (acceptable 0.5–2) means similar spread; after matching all are close to 1.
+- **Spike in PaO₂/FiO₂ (~333):** a "normal" value filled in when no blood gas was measured, so it marks **missing information**, not real oxygenation. In EHR data, whether a test was done can itself be informative.
+:::
+:::
+::::
+
+## Step 4 · Try other matching settings · 매칭 옵션 실험
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (10 min)"}
+Re-run the matching, changing **one** setting at a time:
+
+1. caliper **0.2** (our choice)
+2. caliper **0.05**
+3. **no** caliper
+4. **2** controls per RHC patient, **with** replacement
+5. **full** matching (`method = "full"`)
+
+For each, record in your script: (a) the number of matched RHC patients and (b) the largest |SMD| after matching. Which setting would you choose, and why?
+:::
+
+::: {.callout-warning title="💡 Hint · 힌트"}
+Writing a small function that runs `matchit()` with given settings and returns (a) and (b) saves a lot of copying.
+:::
+
+```{r}
+#| label: experiment
+#| output: false
+fit_variant <- function(...) {
+  m <- matchit(ps_formula, data = rhc, link = "linear.logit", ...)
+  tibble(matched_treated = summary(m)$nn["Matched", "Treated"],
+         matched_controls = round(summary(m)$nn["Matched", "Control"]),
+         max_abs_smd = max(abs(bal.tab(m, binary = "std")$Balance$Diff.Adj[-1])))
+}
+exp_res <- bind_rows(
+  "caliper 0.2"          = fit_variant(method = "nearest", caliper = 0.2),
+  "caliper 0.05"         = fit_variant(method = "nearest", caliper = 0.05),
+  "no caliper"           = fit_variant(method = "nearest"),
+  "2:1 with replacement" = fit_variant(method = "nearest", caliper = 0.2, ratio = 2, replace = TRUE),
+  "full matching"        = fit_variant(method = "full"),
+  .id = "setting")
+exp_res
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+매칭 설정을 하나씩 바꾸며 **매칭된 환자 수**와 **최대 |SMD|**를 비교하세요.
+:::
+
+## Step 4 · Matching settings · Results · 결과
+
+```{r}
+#| label: experiment-out
+#| echo: false
+exp_res |>
+  gt() |>
+  fmt_number(max_abs_smd, decimals = 3) |>
+  cols_label(setting = "Setting", matched_treated = "Matched RHC patients",
+             matched_controls = "Controls used", max_abs_smd = "Largest |SMD|")
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **Caliper 0.05:** fewer RHC patients matched, better balance.
+- **No caliper:** all RHC patients matched, but poor pairs are kept → balance **fails** (largest |SMD| > 0.1).
+- **2:1 with replacement:** more controls per RHC patient; controls can be reused (some count more than once).
+- **Full matching:** keeps **everyone** by forming weighted groups, with good balance.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+캘리퍼를 좁히면 균형은 좋아지지만 매칭되는 환자 수가 줄어듭니다.
+:::
+
+## The bias–variance trade-off · 편향–분산 상충관계
+
+:::: {.columns}
+::: {.column width="50%"}
+**Bias · 편향** = **systematic** error
+
+- From comparing patients who are **not truly comparable** (poor matches → leftover confounding)
+- Does not shrink with a larger sample
+- Reduced by **tighter** matching
+:::
+::: {.column width="50%"}
+**Variance · 분산** = **random** error
+
+- From having **few patients** → wide confidence intervals
+- Reduced by **keeping more** patients (looser caliper, more controls, full matching, weighting)
+:::
+::::
+
+| Choice | Bias | Variance |
+|---|---|---|
+| Tight caliper (0.05) | lower (only close matches) | higher (fewer patients) |
+| No caliper | higher (poor pairs kept) | lower (all RHC patients kept) |
+| Full matching / weighting | low **if** balance is good **and** overlap is adequate | depends on the weights: low if similar, **high if some are extreme** (check ESS) |
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+No method is always best. Keeping everyone avoids discarding patients, but unequal weights lower the ESS. Aim for **good balance (|SMD| < 0.1)**, adequate **ESS**, and acceptable **overlap**, and choose the setting **before** looking at the outcome.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**편향** = 비교 불가능한 환자를 비교해 생기는 체계적 오차. **분산** = 환자 수가 적어 생기는 무작위 오차. 엄격한 매칭: 편향↓ 분산↑. 결과를 보기 **전에** 설정을 정하세요.
+:::
+
+## Step 5 · Risk difference · 위험차 추정
+
+Only now do we look at the outcome · 이제서야 결과(사망)를 봅니다.
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (6 min)"}
+1. In the matched data `md`, fit a linear model of `died30` on `treat`, using the matching `weights`.
+2. Estimate the **ATT risk difference** with a 95% CI. Save as `att_rd`. *(`avg_comparisons()`)*
+:::
+
+::: {.callout-warning title="💡 Hint · 힌트"}
+- Matched pairs are not independent: use cluster-robust standard errors by pair, `vcov = ~subclass`.
+- To average over the **treated** patients (ATT), add `newdata = subset(md, treat == 1)`.
+- In 1:1 matching every `weights` value is 1, so it changes nothing here. Keep it: with other matching methods the weights differ and are required.
+:::
+
+```{r}
+#| label: effect
+#| output: false
+fit <- lm(died30 ~ treat, data = md, weights = weights)
+att_rd <- avg_comparisons(fit, variables = "treat",
+                          vcov = ~subclass,
+                          newdata = subset(md, treat == 1))
+att_rd
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+매칭된 쌍을 군집으로 보는 **군집-강건 표준오차**로 **위험차**를 추정합니다.
+:::
+
+## Step 5 · Risk difference · Results · 결과
+
+```{r}
+#| label: effect-out
+#| echo: false
+att_rd
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **ATT risk difference = `r sprintf("%.1f", 100 * att_rd$estimate)` percentage points** (95% CI `r sprintf("%.1f", 100 * att_rd$conf.low)` to `r sprintf("%.1f", 100 * att_rd$conf.high)`; p `r ifelse(att_rd$p.value < 0.001, "< 0.001", sprintf("= %.3f", att_rd$p.value))`).
+- Among matched RHC patients there were about **`r round(100 * att_rd$estimate)` more deaths per 100 patients** (95% CI `r round(100 * att_rd$conf.low)` to `r round(100 * att_rd$conf.high)`) within 30 days than among similar patients without RHC.
+- Smaller than the crude difference (`r sprintf("%.1f", 100 * crude$estimate)` points): part of the crude difference was confounding — but not all of it.
+- **Where is the propensity score?** The model is a simple comparison of death rates. The PS did its work earlier, by choosing the patients in `md`. The same model on the full data `rhc` gives the crude estimate.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**ATT 위험차** = `r sprintf("%.1f", 100 * att_rd$estimate)`%p: 매칭된 RHC 환자에서 100명당 약 `r round(100 * att_rd$estimate)`명 더 사망했습니다 (95% CI `r round(100 * att_rd$conf.low)`–`r round(100 * att_rd$conf.high)`명) — 비슷한 비시행 환자와 비교한 결과입니다. 성향점수는 결과 모형이 아니라 **분석할 환자를 선택**하는 데 사용되었습니다.
+:::
+
+## Step 5 · Risk ratio and odds ratio · 위험비와 오즈비
+
+One model, three effect measures: only the `comparison` argument changes.
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (5 min)"}
+Using the **same model** `fit` from the risk-difference step:
+
+1. Estimate the **ATT risk ratio** with a 95% CI. Save as `att_rr`.
+2. Estimate the **ATT odds ratio** with a 95% CI, to compare with Connors et al. Save as `att_or`.
+:::
+
+::: {.callout-warning title="💡 Hint · 힌트"}
+In `avg_comparisons()`, add `comparison = "lnratioavg"` (risk ratio) or `comparison = "lnoravg"` (odds ratio), with `transform = "exp"`. `ln` = computed on the log scale; `avg` = ratio of the **average** risks.
+:::
+
+```{r}
+#| label: effect-rr
+#| output: false
+att_rr <- avg_comparisons(fit, variables = "treat", vcov = ~subclass,
+                          newdata = subset(md, treat == 1),
+                          comparison = "lnratioavg", transform = "exp")
+att_or <- avg_comparisons(fit, variables = "treat", vcov = ~subclass,
+                          newdata = subset(md, treat == 1),
+                          comparison = "lnoravg", transform = "exp")
+att_rr
+att_or
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+같은 모형에서 `comparison` 인수만 바꾸어 **위험차, 위험비, 오즈비**를 모두 구합니다.
+:::
+
+## Step 5 · Risk ratio and odds ratio · Results · 결과
+
+```{r}
+#| label: effect-rr-out
+#| echo: false
+att_rr
+att_or
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **Risk ratio = `r sprintf("%.2f", att_rr$estimate)`** (95% CI `r sprintf("%.2f", att_rr$conf.low)`–`r sprintf("%.2f", att_rr$conf.high)`): matched RHC patients had a **`r round(100 * (att_rr$estimate - 1))`% higher** risk of death.
+- **Odds ratio = `r sprintf("%.2f", att_or$estimate)`** (95% CI `r sprintf("%.2f", att_or$conf.low)`–`r sprintf("%.2f", att_or$conf.high)`). As expected for a common outcome, it is further from 1 than the RR.
+- `lm()` works here because the model contains only `treat`: it predicts each group's observed death rate. With covariates, use a logistic `glm()` for RR and OR, since a linear model can predict risks outside 0–1.
+- RD and RR agree: control risk ≈ `r percent(mean(md$died30[md$treat == 0]), 1)`, and `r round(100 * (att_rr$estimate - 1))`% of `r percent(mean(md$died30[md$treat == 0]), 1)` ≈ `r sprintf("%.1f", 100 * att_rd$estimate)` percentage points.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**위험비** `r sprintf("%.2f", att_rr$estimate)` (상대적으로 `r round(100 * (att_rr$estimate - 1))`% 높은 위험), **오즈비** `r sprintf("%.2f", att_or$estimate)`. 사망이 흔하므로 오즈비가 위험비보다 1에서 더 멉니다.
+:::
+
+## Step 5 · Comparison with Connors et al. · 원 연구와 비교
+
+| | Connors et al. 1996 | Our analysis |
+|---|---|---|
+| Matching | Propensity score case-matching | Nearest neighbour, caliper 0.2 |
+| Matched pairs | 1,006 | `r format(nrow(md) / 2, big.mark = ",")` |
+| **30-day mortality, odds ratio (95% CI)** | **1.24 (1.03–1.49)** | **`r sprintf("%.2f (%.2f–%.2f)", att_or$estimate, att_or$conf.low, att_or$conf.high)`** |
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- Our odds ratio is **similar** to the published 1.24, and both CIs exclude 1.
+- Connors et al. used a stricter matching procedure (fewer pairs), so the estimates are not identical, but the conclusion is the same: RHC was associated with **higher** 30-day mortality.
+- Our CI is narrower because we kept more pairs.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+우리 결과(오즈비 `r sprintf("%.2f", att_or$estimate)`)는 원 연구(오즈비 1.24)와 비슷합니다. 두 분석 모두 RHC와 **높은 30일 사망률**의 연관성을 보였습니다.
+:::
+
+## Step 5 · Putting it into words · 결과 서술
+
+| Measure | Estimand | Estimate (95% CI) |
+|---|---|---|
+| Crude risk difference | association | `r sprintf("%.1f (%.1f to %.1f)", 100*crude$estimate, 100*crude$conf.low, 100*crude$conf.high)` percentage points |
+| **Matched risk difference** | ATT | **`r sprintf("%.1f (%.1f to %.1f)", 100*att_rd$estimate, 100*att_rd$conf.low, 100*att_rd$conf.high)` percentage points** |
+| **Matched risk ratio** | ATT | **`r sprintf("%.2f (%.2f to %.2f)", att_rr$estimate, att_rr$conf.low, att_rr$conf.high)`** |
+
+> "Among RHC patients for whom a comparable control could be found, RHC within 24 hours was associated with a `r sprintf("%.1f", 100 * att_rd$estimate)` percentage-point higher 30-day mortality (95% CI `r sprintf("%.1f", 100 * att_rd$conf.low)` to `r sprintf("%.1f", 100 * att_rd$conf.high)`; risk ratio `r sprintf("%.2f", att_rr$estimate)`)."
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- Use **"associated with"**, not "caused". The results **suggest** that RHC may increase 30-day mortality, but this is an observational study.
+- A causal interpretation rests on assumptions we **cannot verify** from the data: no unmeasured confounding, positivity, and consistency. The sensitivity analysis (E-value) helps judge how fragile the conclusion is.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+RHC는 30일 사망 위험 증가와 **연관**되었습니다 (`r sprintf("%.1f", 100 * att_rd$estimate)`%p). 이는 인과적 효과를 **시사**하지만, 검증할 수 없는 가정에 의존하므로 단정할 수 없습니다.
+:::
+
+## Step 5 · Doubly robust estimate · 이중 강건 추정
+
+**Doubly robust estimation** combines two adjustments: matching (based on the PS model) **and** an outcome model that includes the covariates. If **at least one** of the two models is correctly specified, the estimate is consistent (approximately unbiased in large samples). It also reduces remaining imbalance in **measured** covariates, but does **not** protect against **unmeasured** confounding.
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (4 min)"}
+1. Repeat the risk-difference model, adding all 50 covariates. Save the result as `att_dr`.
+2. Compare with `att_rd`: does the estimate change? Is the CI narrower?
+:::
+
+```{r}
+#| label: dr
+#| output: false
+fit_dr <- lm(reformulate(c("treat", covs), "died30"), data = md, weights = weights)
+att_dr <- avg_comparisons(fit_dr, variables = "treat", vcov = ~subclass,
+                          newdata = subset(md, treat == 1))
+att_dr
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**이중 강건 추정**: 매칭(성향점수 모형)과 공변량을 포함한 결과모형을 함께 사용합니다. 두 모형 중 **하나만** 올바르게 지정되어도 추정치는 일치성을 가집니다(대표본에서 거의 비편향). **측정되지 않은** 교란은 해결하지 못합니다.
+:::
+
+## Step 5 · Doubly robust · Results · 결과
+
+| Analysis | ATT risk difference, percentage points (95% CI) |
+|---|---|
+| Matching alone (`att_rd`) | `r sprintf("%.1f (%.1f to %.1f)", 100*att_rd$estimate, 100*att_rd$conf.low, 100*att_rd$conf.high)` |
+| Matching + covariates in the outcome model (`att_dr`) | `r sprintf("%.1f (%.1f to %.1f)", 100*att_dr$estimate, 100*att_dr$conf.low, 100*att_dr$conf.high)` |
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **Doubly robust:** nearly the same estimate → the small leftover imbalance in measured covariates did not matter. The CI is slightly **narrower**, because the covariates explain some of the variation in death.
+- Agreement between the two analyses makes the result more credible, but none of them addresses **unmeasured** confounding.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+두 분석의 결과가 거의 같습니다 → 남은 작은 불균형은 결과에 큰 영향이 없었습니다. 측정되지 않은 교란은 여전히 남아 있습니다.
+:::
+
+# Step 6 · Inverse probability of treatment weighting (IPTW) {background-color="#44475a"}
+
+역확률 처치 가중치 — 매칭의 대안
+
+## IPTW: the idea · 기본 개념
+
+Matching **discards** patients. IPTW **keeps everyone** and gives each patient a weight:
+
+$$
+w = \begin{cases} 1 / \text{PS} & \text{if treated} \\ 1 / (1 - \text{PS}) & \text{if untreated} \end{cases}
+$$
+
+:::: {.columns}
+::: {.column width="55%"}
+**Why it works · 원리**
+
+- A treated patient with a **low** PS is unusual, so gets a **large** weight: they represent the many similar patients who were not treated.
+- The same applies to untreated patients with a high PS.
+- The weighted sample is a **pseudo-population** in which treatment no longer depends on the covariates — as if randomized.
+:::
+::: {.column width="45%"}
+**Weights and estimands · 추정 대상**
+
+| Weights | Estimand |
+|---|---|
+| treated 1/PS; untreated 1/(1−PS) | **ATE** |
+| treated 1; untreated PS/(1−PS) | **ATT** |
+:::
+::::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**IPTW**: 환자를 버리지 않고 치료받을 확률의 **역수**로 가중치를 줍니다. 가중된 "가상 집단"에서는 치료가 공변량과 무관해집니다.
+:::
+
+## IPTW: a worked example · 계산 예시
+
+16 patients: 8 **mild**, 8 **severe**. Severe patients are more often treated (PS 0.75 vs 0.25).
+
+```{r}
+#| label: ipw-toy
+#| echo: false
+toy <- tibble(
+  Severity = c("Mild", "Mild", "Severe", "Severe"),
+  Group = c("Treated", "Untreated", "Treated", "Untreated"),
+  `Patients (n)` = c(2, 6, 6, 2),
+  PS = c(0.25, 0.25, 0.75, 0.75)) |>
+  mutate(Weight = if_else(Group == "Treated", 1 / PS, 1 / (1 - PS)),
+         `Weighted n` = `Patients (n)` * Weight)
+toy |>
+  gt() |>
+  fmt_number(c(PS, Weight), decimals = 2) |>
+  fmt_number(`Weighted n`, decimals = 0) |>
+  tab_style(style = cell_text(color = "#50fa7b", weight = "bold"),
+            locations = cells_body(columns = `Weighted n`))
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **Before weighting:** treated = 2 mild + 6 severe (75% severe); untreated = 6 mild + 2 severe (25% severe) → confounded.
+- **Weights:** a mild treated patient is rare (PS 0.25), so gets weight 1/0.25 = **4**; a mild untreated patient is common, so gets 1/0.75 = **1.33**. The reverse holds for severe patients.
+- **After weighting:** both groups contain **8 mild + 8 severe**. Severity is balanced, and each group resembles the whole population → comparing them estimates the **ATE**.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+드물게 치료받은 환자는 큰 가중치(4), 흔한 환자는 작은 가중치(1.33)를 받습니다. 가중 후 두 군 모두 **경증 8 + 중증 8**이 됩니다.
+:::
+
+## IPTW 1 · Compute the weights · 가중치 계산
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (5 min)"}
+1. Using `rhc$ps`, create **ATE weights** `w_ate` (formula on the previous slides).
+2. Summarize the weights. What is the largest?
+3. Plot a histogram of the weights by treatment group. Save as `p_w`. *(a log-scale x-axis helps)*
+:::
+
+```{r}
+#| label: iptw-weights
+#| output: false
+rhc <- rhc |> mutate(w_ate = if_else(treat == 1, 1 / ps, 1 / (1 - ps)))
+summary(rhc$w_ate)
+
+p_w <- ggplot(rhc, aes(w_ate, fill = swang1)) +
+  geom_histogram(bins = 50, alpha = 0.7, position = "identity") +
+  scale_x_log10() +
+  labs(x = "ATE weight (log scale)", y = "Number of patients", fill = NULL,
+       title = "Distribution of IPTW weights")
+p_w
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+치료군은 1/PS, 비치료군은 1/(1−PS)로 **ATE 가중치**를 계산합니다.
+:::
+
+## IPTW 1 · Weights · Results · 결과
+
+:::: {.columns}
+::: {.column width="58%"}
+```{r}
+#| label: iptw-weights-plot
+#| echo: false
+#| fig-width: 6.5
+#| fig-height: 3.2
+p_w
+```
+:::
+::: {.column width="42%"}
+```{r}
+#| label: iptw-weights-out
+#| echo: false
+round(summary(rhc$w_ate), 2)
+```
+:::
+::::
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- Weights are always ≥ 1. The median is **`r sprintf("%.2f", median(rhc$w_ate))`**; the largest is **`r sprintf("%.1f", max(rhc$w_ate))`** — one patient counts as about `r round(max(rhc$w_ate))` patients.
+- Large weights belong to patients whose treatment was **unexpected** given their PS.
+- A few very large weights make estimates **unstable**; we try remedies in IPTW 5.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+가중치가 **너무 큰 환자**가 있으면 추정이 불안정해집니다. 최대 가중치를 항상 확인하세요.
+:::
+
+## IPTW 2 · Check balance · 균형 확인
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (5 min)"}
+1. Compute the SMDs of all covariates, unweighted and weighted with `w_ate`, with a 0.1 threshold. Save as `bal_ipw`. *(`bal.tab()` with its `weights` argument)*
+2. How many terms are balanced after weighting?
+3. Draw a Love plot from `bal_ipw`. Save as `p_love_ipw`.
+:::
+
+```{r}
+#| label: iptw-balance
+#| output: false
+bal_ipw <- bal.tab(rhc[, covs], treat = rhc$treat, weights = rhc$w_ate,
+                   s.d.denom = "pooled", binary = "std",
+                   thresholds = c(m = 0.1), un = TRUE)
+bal_ipw$Balanced.mean.diffs
+
+p_love_ipw <- love.plot(bal_ipw, abs = TRUE, thresholds = c(m = 0.1),
+                        var.order = "unadjusted",
+                        colors = c("#ff5555", "#50fa7b"), shapes = c(16, 17),
+                        sample.names = c("Unweighted", "IPTW"))
+p_love_ipw
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+가중 후에도 모든 공변량의 균형을 확인합니다.
+:::
+
+## IPTW 2 · Balance · Results · 결과
+
+:::: {.columns}
+::: {.column width="58%"}
+```{r}
+#| label: iptw-love-out
+#| echo: false
+#| fig-width: 6.5
+#| fig-height: 5.9
+love_top(bal_ipw, labels = c("Unweighted", "IPTW"))
+```
+:::
+::: {.column width="42%"}
+```{r}
+#| label: iptw-bal-out
+#| echo: false
+bal_ipw$Balanced.mean.diffs
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- The plot shows the 25 most imbalanced terms (your plot shows all 70). Red = unweighted, green = IPTW.
+- After weighting, **`r sum(bal_ipw$Balance$M.Threshold == "Balanced, <0.1", na.rm = TRUE)` of `r nrow(bal_ipw$Balance)`** terms are balanced; the largest |SMD| is **`r sprintf("%.3f", max(abs(bal_ipw$Balance$Diff.Adj)))`**.
+- IPTW balanced the covariates **without discarding anyone**.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+IPTW 후 모든 |SMD| < 0.1 → 환자를 버리지 않고 균형을 맞췄습니다.
+:::
+:::
+::::
+
+## IPTW 3 · Weighted Table 1 · 가중 기초특성표
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (5 min)"}
+1. Create a **survey design** object that carries the weights. *(survey: `svydesign()`)*
+2. Make the same Table 1 as before, now weighted, with p-values and SMDs. Save as `tbl_ipw`. *(gtsummary: `tbl_svysummary()`, `add_p()`, `add_smd()`)*
+:::
+
+::: {.callout-warning title="💡 Hint · 힌트"}
+`svydesign(ids = ~1, weights = ~w_ate, data = rhc)`. Then `tbl_svysummary()` works like `tbl_summary()`, choosing variables with `include`.
+:::
+
+```{r}
+#| label: iptw-table
+#| output: false
+iptw_design <- svydesign(ids = ~1, weights = ~w_ate, data = rhc)
+tbl_ipw <- tbl_svysummary(iptw_design, by = swang1, include = all_of(key_vars),
+                          label = var_labels,
+                          statistic = all_continuous() ~ "{mean} ({sd})") |>
+  add_p() |>
+  add_smd() |>
+  bold_labels()
+tbl_ipw
+```
+
+## IPTW 3 · Weighted Table 1 · Results · 결과
+
+```{r}
+#| label: iptw-table-out
+#| echo: false
+tbl_ipw
+```
+
+## IPTW 3 · Weighted Table 1 · Interpretation · 해석
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- Numbers are now **weighted** "pseudo-patients": about `r format(round(sum(rhc$w_ate[rhc$treat == 0]), -2), big.mark = ",")` without RHC and `r format(round(sum(rhc$w_ate[rhc$treat == 1]), -2), big.mark = ",")` with RHC — each close to the full cohort of `r format(nrow(rhc), big.mark = ",")`, because the ATE compares the whole cohort treated vs the whole cohort untreated.
+- p-values here come from survey-weighted tests; all are large, but as before we judge balance by the SMD.
+- Both groups now resemble the **whole cohort**: e.g., APACHE III ≈ `r round(weighted.mean(rhc$aps1[rhc$treat == 1], rhc$w_ate[rhc$treat == 1]))` in each (cohort mean `r round(mean(rhc$aps1))`), and every |SMD| < 0.1.
+- After **matching**, both groups resembled the **RHC patients** (ATT). After **IPTW**, both resemble **everyone** (ATE).
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+IPTW 후 두 군은 **전체 코호트**와 비슷해집니다 (ATE). 매칭 후에는 **RHC 환자**와 비슷했습니다 (ATT).
+:::
+
+## IPTW 4 · Estimate the ATE · 평균처치효과 추정
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (5 min)"}
+1. Estimate the **ATE risk difference**: a weighted linear model of `died30` on `treat` in the full data, then `avg_comparisons()`. Save as `ate_rd`.
+2. Estimate the **ATE risk ratio** the same way with a weighted `glm()` (`family = quasibinomial()`: same estimates as `binomial()`, but no warning about non-integer weights). Save as `ate_rr`.
+:::
+
+::: {.callout-warning title="💡 Hint · 힌트"}
+There are no pairs, so use robust standard errors (`vcov = "HC3"`) instead of `~subclass`, and leave out `newdata` so the effect is averaged over **all** patients.
+:::
+
+```{r}
+#| label: iptw-effect
+#| output: false
+fit_ipw <- lm(died30 ~ treat, data = rhc, weights = w_ate)
+ate_rd  <- avg_comparisons(fit_ipw, variables = "treat", vcov = "HC3")
+
+fit_ipw_log <- glm(died30 ~ treat, data = rhc, weights = w_ate, family = quasibinomial())
+ate_rr  <- avg_comparisons(fit_ipw_log, variables = "treat", vcov = "HC3",
+                           comparison = "lnratioavg", transform = "exp")
+ate_rd
+ate_rr
+```
+
+::: {.callout-caution title="🇰🇷 핵심"}
+가중 모형으로 **ATE** 위험차와 위험비를 추정합니다.
+:::
+
+## IPTW 4 · ATE · Results · 결과
+
+```{r}
+#| label: iptw-effect-out
+#| echo: false
+ate_rd
+ate_rr
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **ATE risk difference = `r sprintf("%.1f", 100 * ate_rd$estimate)` percentage points** (95% CI `r sprintf("%.1f", 100 * ate_rd$conf.low)` to `r sprintf("%.1f", 100 * ate_rd$conf.high)`): if **every** patient in the cohort received RHC, 30-day mortality would be about `r sprintf("%.1f", 100 * ate_rd$estimate)` points higher than if **none** did.
+- **ATE risk ratio = `r sprintf("%.2f", ate_rr$estimate)`** (95% CI `r sprintf("%.2f", ate_rr$conf.low)`–`r sprintf("%.2f", ate_rr$conf.high)`).
+- Close to the matched ATT (RD `r sprintf("%.1f", 100 * att_rd$estimate)`, RR `r sprintf("%.2f", att_rr$estimate)`), although it answers a different question.
+- These robust SEs ignore that the PS was estimated, so the CI is usually slightly too wide (conservative).
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**ATE**: 모든 환자가 RHC를 받은 경우 vs 아무도 받지 않은 경우, 30일 사망 위험이 `r sprintf("%.1f", 100 * ate_rd$estimate)`%p 높습니다 (위험비 `r sprintf("%.2f", ate_rr$estimate)`).
+:::
+
+## IPTW 5 · Variations on the weights · 가중치 변형
+
+Three common variations. The code is longer, so it is shown in full — **run it and compare the results**.
+
+- **Stabilized ATE weights** `w_stab`: multiply each weight by the overall proportion treated (treated patients) or untreated (untreated patients) → same estimate, smaller extreme weights
+- **Trimmed ATE weights** `w_trim`: cap the weights at their 99th percentile
+- **ATT weights** `w_att`: 1 for treated, PS/(1 − PS) for untreated; average over treated patients only
+
+```{r}
+#| label: iptw-variants
+#| output: false
+#| code-fold: false
+p_treat <- mean(rhc$treat)
+rhc <- rhc |>
+  mutate(w_stab = if_else(treat == 1, p_treat / ps, (1 - p_treat) / (1 - ps)),
+         w_trim = pmin(w_ate, quantile(w_ate, 0.99)),
+         w_att  = if_else(treat == 1, 1, ps / (1 - ps)))
+
+rd_with <- function(w, att = FALSE) {
+  f  <- lm(died30 ~ treat, data = rhc, weights = rhc[[w]])
+  nd <- if (att) subset(rhc, treat == 1) else rhc
+  avg_comparisons(f, variables = "treat", vcov = "HC3", newdata = nd)
+}
+ipw_variants <- tibble(
+  weights  = c("w_ate", "w_stab", "w_trim", "w_att"),
+  estimand = c("ATE", "ATE", "ATE (trimmed)", "ATT"),
+  max_w    = map_dbl(weights, \(w) max(rhc[[w]])),
+  res      = map2(weights, estimand == "ATT", rd_with)) |>
+  mutate(rd = map_dbl(res, "estimate"), lo = map_dbl(res, "conf.low"),
+         hi = map_dbl(res, "conf.high")) |>
+  select(-res)
+ipw_variants
+```
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (5 min)"}
+Run the code. Which weights have the largest maximum weight? Do the risk differences differ?
+:::
+
+## IPTW 5 · Variations · Results · 결과
+
+```{r}
+#| label: iptw-variants-out
+#| echo: false
+ipw_variants |>
+  mutate(across(c(rd, lo, hi), \(x) 100 * x)) |>
+  gt() |>
+  fmt_number(max_w, decimals = 1) |>
+  fmt_number(c(rd, lo, hi), decimals = 1) |>
+  cols_merge(c(lo, hi), pattern = "{1} to {2}") |>
+  cols_label(weights = "Weights", estimand = "Estimand", max_w = "Largest weight",
+             rd = "Risk difference (pp)", lo = "95% CI")
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **Stabilized:** the same estimate as ordinary ATE weights, with a much smaller largest weight. In more complex models this gives more stable results.
+- **Trimmed:** the estimate changes only slightly → the extreme weights were not driving the result.
+- **ATT weights:** `r sprintf("%.1f", 100 * ipw_variants$rd[ipw_variants$weights == "w_att"])` percentage points, similar to the matched ATT (`r sprintf("%.1f", 100 * att_rd$estimate)`): two methods, the same estimand, similar answers.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**안정화 가중치**는 추정치는 같고 극단값이 작습니다. **절단**해도 결과가 비슷하고, **ATT 가중치** 결과는 매칭 결과와 비슷합니다.
+:::
+
+# Comparing methods & sensitivity analysis {background-color="#44475a"}
+
+방법 비교와 민감도 분석
+
+## Comparing approaches · 방법 비교
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (6 min)"}
+1. Estimate the ATE with an **outcome regression**: a logistic model of `died30` on `treat` and all 50 covariates in the full data, then `avg_comparisons()`. Save as `adj`.
+2. Collect the risk differences from `crude`, `adj`, `att_rd`, `att_dr`, and `ate_rd` in one data frame.
+3. Draw a **forest plot**: one point and 95% CI per method, with a line at 0. Save as `p_forest`. *(`geom_point()`, `geom_errorbarh()`)*
+:::
+
+```{r}
+#| label: compare
+#| output: false
+adj_fit <- glm(reformulate(c("treat", covs), "died30"), family = binomial, data = rhc)
+adj     <- avg_comparisons(adj_fit, variables = "treat", vcov = "HC3")
+
+res <- bind_rows(
+  tibble(method = "Crude (no adjustment)",       est = crude$estimate,  lo = crude$conf.low,  hi = crude$conf.high),
+  tibble(method = "Outcome regression (ATE)",    est = adj$estimate,    lo = adj$conf.low,    hi = adj$conf.high),
+  tibble(method = "PS matching (ATT)",           est = att_rd$estimate, lo = att_rd$conf.low, hi = att_rd$conf.high),
+  tibble(method = "Matching + regression (ATT)", est = att_dr$estimate, lo = att_dr$conf.low, hi = att_dr$conf.high),
+  tibble(method = "IPTW (ATE)",                  est = ate_rd$estimate, lo = ate_rd$conf.low, hi = ate_rd$conf.high)
+) |>
+  mutate(across(c(est, lo, hi), \(x) 100 * x),
+         method = fct_rev(fct_inorder(method)))
+
+p_forest <- ggplot(res, aes(est, method)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey60") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.2, colour = "#8be9fd") +
+  geom_point(size = 3.5, colour = "#ff79c6") +
+  labs(x = "Risk difference, 30-day mortality (percentage points)", y = NULL,
+       title = "RHC and 30-day mortality: five estimates")
+p_forest
+```
+
+## Comparing approaches · Results · 결과
+
+```{r}
+#| label: forest-out
+#| echo: false
+#| fig-width: 9
+#| fig-height: 3.4
+p_forest
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- Each point is a risk difference; each line is its 95% CI; the dashed line is 0 (no effect).
+- All adjusted estimates (`r sprintf("%.1f to %.1f", min(res$est[-1]), max(res$est[-1]))` points) are **smaller** than the crude estimate (`r sprintf("%.1f", res$est[1])`): part of the crude difference was confounding by severity.
+- All CIs exclude 0, and all point the same way: **no sign of benefit, and likely harm**.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+보정한 결과는 모두 단순 비교보다 작지만, 모두 **같은 방향**(사망 위험 증가)을 가리킵니다.
+:::
+
+## Comparing approaches · Table · 결과표
+
+```{r}
+#| label: compare-tab
+#| echo: false
+res |>
+  arrange(desc(method)) |>
+  mutate(method = as.character(method)) |>
+  gt() |>
+  fmt_number(c(est, lo, hi), decimals = 1) |>
+  cols_merge(c(lo, hi), pattern = "{1} to {2}") |>
+  cols_label(method = "Method", est = "Risk difference (pp)", lo = "95% CI")
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **Outcome regression** and **IPTW** estimate the **ATE** (whole cohort); **matching** estimates the **ATT** (matchable RHC patients). Small differences are expected because they answer different questions.
+- These methods rely on different models (outcome model vs PS model). Their agreement is reassuring — but none of them can remove **unmeasured** confounding.
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+서로 다른 모형에 기반한 방법들의 결과가 비슷하면 결론에 더 확신을 가질 수 있습니다. 단, **측정되지 않은 교란**은 해결하지 못합니다.
+:::
+
+## Sensitivity analysis: the E-value · 민감도 분석
+
+How strong would an **unmeasured confounder** have to be to explain away our result?
+
+$$
+E = RR + \sqrt{RR \times (RR - 1)}
+$$
+
+The E-value is the minimum risk ratio that an unmeasured confounder would need with **both** RHC **and** death — beyond the measured covariates — to fully explain the observed association.
+
+::: {.callout-tip title="🧑‍💻 Your turn · 직접 해보기 (5 min)"}
+1. Compute the E-value for the **matched risk ratio** `att_rr` (estimate and CI). Save as `ev`. *(EValue: `evalues.RR()`)*
+2. Do the same for the **crude** risk ratio (get it from `crude_fit` with `comparison = "lnratioavg"`, as in Step 5).
+:::
+
+```{r}
+#| label: evalue
+#| output: false
+ev <- evalues.RR(est = att_rr$estimate, lo = att_rr$conf.low, hi = att_rr$conf.high)
+ev
+
+crude_rr <- avg_comparisons(crude_fit, variables = "treat", vcov = "HC3",
+                            comparison = "lnratioavg", transform = "exp")
+ev_crude <- evalues.RR(est = crude_rr$estimate, lo = crude_rr$conf.low, hi = crude_rr$conf.high)
+ev_crude
+```
+
+## E-value · Results · 결과
+
+```{r}
+#| label: evalue-out
+#| echo: false
+ev
+ev_crude
+```
+
+::: {.callout-note title="🔎 Interpretation · 해석"}
+- **Matched RR `r sprintf("%.2f", att_rr$estimate)`:** E-value (`point`) = **`r sprintf("%.2f", ev["E-values", "point"])`**. An unmeasured confounder associated with both RHC and death by a risk ratio of `r sprintf("%.2f", ev["E-values", "point"])` **each** could fully explain the association. For the CI limit (`lower`): **`r sprintf("%.2f", ev["E-values", "lower"])`** would be enough to make the CI include 1. (`upper` is `NA`: only the limit nearer 1 matters.)
+- **Crude RR `r sprintf("%.2f", crude_rr$estimate)`:** E-value `r sprintf("%.2f", ev_crude["E-values", "point"])`.
+- Is a confounder of strength ≈ `r sprintf("%.1f", ev["E-values", "point"])` plausible? A doctor's bedside impression of how sick a patient is might be that strong → the evidence for **harm** is moderate. (Connors et al.'s sensitivity analysis asked a different question: a hidden confounder would need to raise both RHC use and death about 6-fold to make a truly *beneficial* RHC look harmful.)
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+**E-값** `r sprintf("%.2f", ev["E-values", "point"])`: 측정되지 않은 교란변수가 RHC와 사망 **모두와** 위험비 `r sprintf("%.2f", ev["E-values", "point"])` 이상으로 연관되어야 결과를 설명할 수 있습니다. 클수록 **견고**합니다.
+:::
+
+## EHR-specific pitfalls · EHR 자료의 함정
+
+:::: {.columns}
+::: {.column width="50%"}
+**Missing data · 결측치**
+
+- Labs are ordered *because* a doctor was worried → missingness carries information
+- Consider multiple imputation (e.g., `mice` with `MatchThem`)
+
+**Time · 시간**
+
+- Define **time zero** clearly (e.g., ICU admission)
+- Covariates **before** time zero, outcome **after**
+- Avoid **immortal time bias**
+:::
+::: {.column width="50%"}
+**Measurement · 측정**
+
+- Diagnosis codes ≠ disease
+- "No code" ≠ "no disease"
+
+**Design · 설계**
+
+- **Target trial emulation**: write the protocol of the trial you wish you had, then emulate it with EHR data
+- **New-user, active-comparator** designs
+:::
+::::
+
+::: {.callout-tip title="🧑‍💻 Discuss · 토론 (3 min)"}
+Write a 5-line **target trial protocol** for the RHC question: eligibility, treatment strategies, time zero, outcome, follow-up. Which element is hardest to define with EHR data?
+:::
+
+::: {.callout-caution title="🇰🇷 핵심"}
+실제 EHR 연구에서는 **결측치, 시간 정의(time zero), 코드 오분류**가 성향점수 모형보다 더 큰 문제일 수 있습니다.
+:::
+
+## Reporting checklist · 보고 체크리스트
+
+| Report | 보고 항목 |
+|---|---|
+| Question, time zero, estimand (ATT / ATE) | 연구 질문·추정 대상 |
+| Covariates and why they were chosen | 공변량 선택 근거 |
+| PS model and overlap plot | 성향점수 모형·중첩 그래프 |
+| Matching method, ratio, caliper, replacement | 매칭 방법 |
+| Number matched and unmatched | 매칭/미매칭 수 |
+| Table 1 with SMD before and after; Love plot | 매칭 전후 균형 |
+| Effect estimates (RD, RR), 95% CI, SE method | 효과 추정치 |
+| Sensitivity analyses (IPTW, doubly robust, E-value) | 민감도 분석 |
+| Handling of missing data | 결측치 처리 |
+
+Reviewers look first at the **balance table** and the **number of matched patients** · 리뷰어는 **균형표**와 **매칭된 환자 수**를 가장 먼저 봅니다.
+
+## Key takeaways · 핵심 요약
+
+1. In EHR data, treatment is **not random** → confounding by indication · 치료는 무작위가 아니다
+2. A **propensity score** summarizes many covariates in one number · 성향점수 = 치료받을 확률
+3. **Design first, outcome last** · 설계 먼저, 결과는 마지막
+4. Judge the PS model by **balance (|SMD| < 0.1)**, not p-values · 균형으로 평가
+5. Know your **estimand**: matching → ATT; IPTW → ATE · 추정 대상을 명확히
+6. Report the **risk difference and the risk ratio** · 위험차와 위험비 모두 보고
+7. PS methods **cannot fix unmeasured confounding** → sensitivity analysis · 측정되지 않은 교란은 해결 불가
+
+::: {.callout-caution title="🇰🇷 핵심"}
+성향점수 방법은 관찰연구를 **무작위 시험처럼 설계**하려는 도구입니다. 가정과 한계를 함께 보고하세요.
+:::
+
+## Glossary · 용어 정리
+
+:::: {.columns}
+::: {.column width="50%"}
+| English | 한국어 |
+|---|---|
+| Electronic health record | 전자건강기록 |
+| Right heart catheterization | 우심도자술 |
+| Observational study | 관찰연구 |
+| Randomized controlled trial | 무작위 대조 시험 |
+| Confounding by indication | 적응증에 의한 교란 |
+| Propensity score | 성향점수 |
+| Covariate balance | 공변량 균형 |
+| Standardized mean difference | 표준화 평균차이 |
+| Overlap | 중첩 |
+| Positivity / exchangeability | 양수성 / 교환가능성 |
+:::
+::: {.column width="50%"}
+| English | 한국어 |
+|---|---|
+| Nearest-neighbour matching | 최근접 이웃 매칭 |
+| Caliper | 캘리퍼 |
+| With / without replacement | 복원 / 비복원 |
+| ATE / ATT | 평균처치효과 / 처치군 평균처치효과 |
+| Risk difference / ratio | 위험차 / 위험비 |
+| Odds ratio | 오즈비 |
+| Percentage points | 퍼센트포인트 (%p) |
+| Inverse probability weighting | 역확률 가중치 |
+| Doubly robust | 이중 강건 |
+| Sensitivity analysis | 민감도 분석 |
+:::
+::::
+
+## References · 참고문헌 (1) · Papers
+
+- Connors AF et al. The effectiveness of right heart catheterization in the initial care of critically ill patients. *JAMA* 1996;276:889–897.
+- Rosenbaum PR, Rubin DB. The central role of the propensity score in observational studies for causal effects. *Biometrika* 1983;70:41–55.
+- Austin PC. An introduction to propensity score methods for reducing the effects of confounding in observational studies. *Multivar Behav Res* 2011;46:399–424.
+- Austin PC, Stuart EA. Moving towards best practice when using inverse probability of treatment weighting (IPTW). *Stat Med* 2015;34:3661–3679.
+- Stuart EA. Matching methods for causal inference: a review and a look forward. *Stat Sci* 2010;25:1–21.
+- Westreich D, Cole SR. Invited commentary: positivity in practice. *Am J Epidemiol* 2010;171:674–677.
+- Hernán MA, Robins JM. Using big data to emulate a target trial when a randomized trial is not available. *Am J Epidemiol* 2016;183:758–764.
+- VanderWeele TJ, Ding P. Sensitivity analysis in observational research: introducing the E-value. *Ann Intern Med* 2017;167:268–274.
+
+## References · 참고문헌 (2) · Tutorials, software & data
+
+- Greifer N. *Estimating Effects After Matching* — `vignette("estimating-effects", package = "MatchIt")`; also `vignette("MatchIt")` and `vignette("cobalt")`
+- IQSS Data Science Services. *Matching* (RHC example with MatchIt and marginaleffects) — <https://iqss.github.io/dss-ps/ex-match.html>
+- gtsummary — <https://www.danieldsjoberg.com/gtsummary/>; marginaleffects — <https://marginaleffects.com/>
+- SUPPORT data documentation (normal fill-in values for missing labs) — <https://hbiostat.org/data/repo/supportdesc>
+- Data: Vanderbilt Biostatistics datasets — <https://hbiostat.org/data/>
+
+# Questions? · 질문 {background-color="#44475a"}
+
+Thank you · 감사합니다
