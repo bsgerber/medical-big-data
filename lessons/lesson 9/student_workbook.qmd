@@ -1,0 +1,258 @@
+---
+title: "Predicting 30-day hospital readmission"
+subtitle: "Simulated hospital data · Student workbook"
+format:
+  html:
+    toc: true
+    toc-depth: 1
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    code-copy: true
+execute:
+  eval: false     # change to true to render your finished work
+  warning: false
+  message: false
+---
+
+::: {.callout-note}
+## How this session works
+- Fill in each code chunk, and under **Notes** write what you decided and why. Be brief!
+- The setup chunks are done for you. This starter is in R, but you may use Python (pandas and scikit-learn) instead especially for machine learning.
+- Part 1 is develop the prediction model, and Part 2 is external validation
+:::
+
+# The task and the data
+
+> **At the moment of hospital discharge**, predict whether an adult with diabetes will be **readmitted within 30 days**.
+
+The model will help a nurse follow-up program decide which discharged patients to call for support. Each row is one hospital stay. All data are simulated.
+
+| Variable | Description | Values |
+|---|---|---|
+| `stay_id` | Unique ID for each hospital stay | Text |
+| `patient_id` | Unique ID for each patient (a patient can have more than one stay) | Text |
+| `age_group` | Age at admission | 18-44, 45-64, 65-74, 75-84, 85+ |
+| `sex` | Sex recorded at admission | Female, Male |
+| `race` | Race recorded at registration | White, Black, Hispanic, Asian, Other; blank = not recorded |
+| `insurance` | Primary payer at admission | Medicare, Medicaid, Private, Self-pay; blank = not recorded |
+| `admission_type` | Type of admission | Emergency, Urgent, Elective |
+| `primary_dx` | Primary diagnosis group for this stay | Circulatory, Respiratory, Diabetes, Digestive, Injury, Other |
+| `length_of_stay` | Days from admission to discharge | Days; valid range 1–14 |
+| `num_medications` | Number of distinct medications given during the stay | Count |
+| `num_diagnoses` | Number of diagnoses recorded for the stay | Count |
+| `prior_inpatient` | Inpatient admissions in the 12 months before this stay | Count |
+| `prior_er` | Emergency visits in the 12 months before this stay | Count |
+| `a1c_result` | HbA1c result during the stay | Normal, High; blank = not tested |
+| `discharge_to` | Discharge destination | Home, Home health, Facility (SNF), Hospice, Died |
+| `followup_call_30d` | Care-management phone call completed in the 30 days after discharge | Yes, No |
+| `readmit_30d` | **OUTCOME:** readmitted within 30 days of discharge | Yes, No |
+
+# Part 1 setup
+
+Part 1 uses data from **Northfield Health**.
+
+```{r setup}
+pkgs <- c("tidyverse", "tidymodels", "themis", "ranger", "gtsummary", "naniar", "probably")
+missing_pkgs <- setdiff(pkgs, rownames(installed.packages()))
+if (length(missing_pkgs) > 0) install.packages(missing_pkgs)
+
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(gtsummary)
+library(naniar)
+library(probably)
+tidymodels_prefer()
+set.seed(2026)
+
+# "Yes" is the first level, so tidymodels treats readmission as the event
+northfield <- read_csv("data/northfield_readmission.csv", show_col_types = FALSE) |>
+  mutate(readmit_30d = factor(readmit_30d, levels = c("Yes", "No")))
+```
+
+# Describe the data (10 min)
+
+Count stays and unique patients, find the readmission rate, and check missingness.
+
+**Useful functions:** `n_distinct()`, `count()`, `naniar::gg_miss_var(show_pct = TRUE)`
+
+**Think about:** Is the outcome balanced? Is A1C missing at random? Compare readmission for tested vs. not tested patients, and testing rates by insurance.
+
+```{r}
+# your code
+```
+
+**Notes:**
+
+# Explore (10 min)
+
+Look at the distributions of key variables (`length_of_stay`, `prior_inpatient`, `num_diagnoses`, `age_group`) and how each one relates to readmission.
+
+**Useful functions:** `ggplot()` with `geom_histogram()` or `geom_bar()`; `reframe(rate = mean(readmit_30d == "Yes"), .by = ...)`; `tbl_summary(by = readmit_30d)` after removing the ID columns
+
+**Think about:** Any impossible values? Any variable related to readmission *too* strongly, and would you know it at discharge? Who can't be readmitted at all?
+
+```{r}
+# your code
+```
+
+**Notes:**
+
+# Prepare the data (10 min)
+
+Create `cohort`: exclude patients not at risk, fix impossible values, drop variables you won't use as predictors, and handle missing values (for example, a "Not tested" category for A1C).
+
+**Useful functions:** `filter()`, `mutate()`, `if_else()`, `replace_na()`, `select()`
+
+**Tip:** write these steps as a function, such as `prepare <- function(data) {...}`, so you can reuse it on the second hospital in Part 2 (optional).
+
+```{r}
+# your code
+```
+
+**Notes:**
+
+# Split into training and test sets (5 min)
+
+Create `train` (75%) and `test` (25%). Should all of a patient's stays go into the same set?
+
+**Useful functions:** `initial_split()` or `group_initial_split(group = patient_id)`, `training()`, `testing()`
+
+```{r}
+# your code
+```
+
+**Notes:**
+
+# Class imbalance (5 min)
+
+Decide whether to rebalance the training data. One option is **random undersampling**: keep all readmissions and a random sample of non-readmissions. You could also use oversampling, SMOTE, or no rebalancing.
+
+**Useful functions:** recipe steps from themis: `step_downsample(readmit_30d)`, `step_upsample(readmit_30d)`, or `step_smote(readmit_30d)` (after `step_dummy()`)
+
+**Think about:** After rebalancing, how will predicted probabilities compare with the real readmission rate?
+
+```{r}
+# your code
+```
+
+**Notes:**
+
+# Build two models (15 min)
+
+Fit **logistic regression** and at least **one other model**: random forest, SVM, XGBoost, LASSO, naive Bayes, or another. Train on `train` only.
+
+**Useful functions:**
+
+- `recipe(readmit_30d ~ ., data = train)` with `step_rm()` (IDs and unused variables), `step_impute_median(all_numeric_predictors())`, `step_dummy(all_nominal_predictors())`
+- `logistic_reg()`, `rand_forest(mode = "classification")`, `svm_rbf(mode = "classification")` (needs kernlab), `boost_tree(mode = "classification")` (needs xgboost)
+- `fit(workflow(rec, model), train)`, then `augment(fitted_model, test)`, which adds a `.pred_Yes` column
+
+```{r}
+# your code
+```
+
+**Notes:**
+
+# Discrimination (5 min)
+
+How well does each model rank patients on the test set? Report AUROC (and PR-AUC if time allows), and plot ROC curves.
+
+**Useful functions:** `roc_auc(truth = readmit_30d, .pred_Yes)`, `pr_auc()`, `roc_curve() |> autoplot()`
+
+```{r}
+# your code
+```
+
+**Notes:**
+
+# Calibration (5 min)
+
+Do predicted risks match observed readmission rates on the test set?
+
+**Useful functions:** `cal_plot_breaks(truth = readmit_30d, estimate = .pred_Yes)`, `brier_class()`; compare the mean of `.pred_Yes` with the observed rate
+
+**Think about:** For the nurse program, which matters more: ranking patients well, or giving accurate risks?
+
+```{r}
+# your code
+```
+
+**Notes:**
+
+# Explain the model (10 min)
+
+Which factors drive readmission? Use either:
+
+- **Logistic regression:** `glm(readmit_30d == "Yes" ~ ..., family = binomial, data = train)`, then `tidy(exponentiate = TRUE, conf.int = TRUE)` for odds ratios, or
+- **Your other model:** SHAP (`kernelshap` and `shapviz` packages) or variable importance (for example `set_engine("ranger", importance = "permutation")`)
+
+**Think about:** Do the top factors make clinical sense? Are any about the care process (such as A1C testing) rather than the patient?
+
+```{r}
+# your code
+```
+
+**Notes:**
+
+# Part 2 setup (given)
+
+Part 2 tests your **Part 1 models, unchanged**, on a second hospital, **Coastal Valley Medical**. It has the same columns and codebook. Continue in this document and R session. You will need to load the second data file here.
+
+```{r setup-part2}
+coastal <- read_csv("data/coastal_readmission.csv", show_col_types = FALSE) |>
+  mutate(readmit_30d = factor(readmit_30d, levels = c("Yes", "No")))
+```
+
+# Compare the hospitals (5 min)
+
+Compare the two hospitals' patients: readmission rate, age, A1C testing, prior admissions, and anything else your model relies on.
+
+**Useful functions:** `bind_rows(Northfield = northfield, Coastal = coastal, .id = "site")`, then `tbl_summary(by = site)` on a few selected columns, or `reframe(..., .by = site)`
+
+**Think about:** Which differences might change how well your models work?
+
+```{r}
+# your code
+```
+
+**Notes:**
+
+# Prepare and predict (10 min)
+
+Apply the **same** preparation steps to `coastal`, then predict with your Part 1 models. **Don't retrain.**
+
+**Useful functions:** your `prepare()` function, `augment(fitted_model, new_data)`
+
+```{r}
+# your code
+```
+
+**Notes:**
+
+# Discrimination at the new hospital (5 min)
+
+Compare AUROC at Coastal with your Part 1 test-set AUROC for both models.
+
+**Useful functions:** `roc_auc()` or `roc_auc_vec()`, `roc_curve() |> autoplot()`
+
+```{r}
+# your code
+```
+
+**Notes:**
+
+# Calibration at the new hospital (5 min)
+
+Compare predicted and observed readmission at Coastal.
+
+**Useful functions:** `cal_plot_breaks()`; mean of `.pred_Yes` vs. the observed rate
+
+**Think about:** Did ranking or calibration suffer more? What would you need before using this model at Coastal?
+
+```{r}
+# your code
+```
+
+**Notes:**
